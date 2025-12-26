@@ -10,16 +10,29 @@ interface TrackCardProps {
   previewUrl?: string | null;
   spotifyUrl?: string | null;
   index?: number;
+  // Audio features (0-1 scale from Spotify)
+  energy?: number | null;
+  valence?: number | null;
+  danceability?: number | null;
+  tempo?: number | null;
+  acousticness?: number | null;
+  showFeatures?: boolean;
 }
 
-export default function TrackCard({ 
-  track, 
-  artist, 
-  imageUrl, 
-  subtitle, 
+export default function TrackCard({
+  track,
+  artist,
+  imageUrl,
+  subtitle,
   previewUrl,
   spotifyUrl,
-  index = 0 
+  index = 0,
+  energy,
+  valence,
+  danceability,
+  tempo,
+  acousticness,
+  showFeatures = false,
 }: TrackCardProps) {
   const [isPlaying, setIsPlaying] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -85,6 +98,59 @@ export default function TrackCard({
           <p className="text-sm text-[var(--text-secondary)] truncate">{artist}</p>
           {subtitle && (
             <p className="text-xs text-[var(--text-muted)] mt-1">{subtitle}</p>
+          )}
+          {/* Audio feature badges */}
+          {showFeatures && (energy != null || valence != null || tempo != null) && (
+            <div className="flex flex-wrap gap-1 mt-2">
+              {energy != null && (
+                <span
+                  className="text-[10px] px-1.5 py-0.5 rounded-full"
+                  style={{
+                    backgroundColor: `hsl(${energy * 60}, 70%, 40%)`,
+                    color: 'white',
+                  }}
+                  title={`Energy: ${Math.round(energy * 100)}%`}
+                >
+                  ⚡{Math.round(energy * 100)}
+                </span>
+              )}
+              {valence != null && (
+                <span
+                  className="text-[10px] px-1.5 py-0.5 rounded-full"
+                  style={{
+                    backgroundColor: `hsl(${valence * 120}, 60%, 45%)`,
+                    color: 'white',
+                  }}
+                  title={`Mood: ${Math.round(valence * 100)}% (higher = happier)`}
+                >
+                  {valence > 0.5 ? '😊' : '😔'}{Math.round(valence * 100)}
+                </span>
+              )}
+              {tempo != null && (
+                <span
+                  className="text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--accent-secondary)]/30 text-[var(--accent-secondary)]"
+                  title={`Tempo: ${Math.round(tempo)} BPM`}
+                >
+                  🎵{Math.round(tempo)}
+                </span>
+              )}
+              {danceability != null && danceability > 0.6 && (
+                <span
+                  className="text-[10px] px-1.5 py-0.5 rounded-full bg-pink-500/30 text-pink-400"
+                  title={`Danceability: ${Math.round(danceability * 100)}%`}
+                >
+                  💃
+                </span>
+              )}
+              {acousticness != null && acousticness > 0.6 && (
+                <span
+                  className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-500/30 text-amber-400"
+                  title={`Acoustic: ${Math.round(acousticness * 100)}%`}
+                >
+                  🎸
+                </span>
+              )}
+            </div>
           )}
         </div>
 

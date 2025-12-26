@@ -9,7 +9,7 @@ export default function PodcastsPage() {
 
   const { data: stats } = useQuery({
     queryKey: ['podcastStats'],
-    queryFn: getPodcastStats,
+    queryFn: () => getPodcastStats(),
   });
 
   const { data: shows } = useQuery({

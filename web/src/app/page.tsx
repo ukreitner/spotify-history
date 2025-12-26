@@ -37,7 +37,7 @@ function CustomTooltip({ active, payload, label }: any) {
 export default function Dashboard() {
   const { data: overview, isLoading: loadingOverview } = useQuery({
     queryKey: ['overview'],
-    queryFn: getOverview,
+    queryFn: () => getOverview(),
   });
 
   const { data: artists } = useQuery({
@@ -52,12 +52,12 @@ export default function Dashboard() {
 
   const { data: patterns } = useQuery({
     queryKey: ['listeningPatterns'],
-    queryFn: getListeningPatterns,
+    queryFn: () => getListeningPatterns(),
   });
 
   const { data: streaks } = useQuery({
     queryKey: ['listeningStreaks'],
-    queryFn: getListeningStreaks,
+    queryFn: () => getListeningStreaks(),
   });
 
   const { data: topTracks } = useQuery({

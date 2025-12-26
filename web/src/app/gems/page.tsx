@@ -7,7 +7,7 @@ import TrackCard from '@/components/TrackCard';
 export default function GemsPage() {
   const { data: gems, isLoading, error } = useQuery({
     queryKey: ['forgottenGems'],
-    queryFn: getForgottenGems,
+    queryFn: () => getForgottenGems(),
   });
 
   if (isLoading) {

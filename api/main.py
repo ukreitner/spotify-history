@@ -148,21 +148,50 @@ def recommendations_custom(
     discovery_ratio: int = 30,
     artist_filter: str = "all",
     limit: int = 30,
+    # Audio feature filters (0-100)
+    energy_min: Optional[int] = None,
+    energy_max: Optional[int] = None,
+    valence_min: Optional[int] = None,
+    valence_max: Optional[int] = None,
+    danceability_min: Optional[int] = None,
+    danceability_max: Optional[int] = None,
+    tempo_min: Optional[int] = None,  # In BPM
+    tempo_max: Optional[int] = None,
+    acousticness_min: Optional[int] = None,
+    acousticness_max: Optional[int] = None,
+    # Other filters
+    year_min: Optional[int] = None,
+    year_max: Optional[int] = None,
+    exclude_artists: str = "",
 ):
-    """Generate a custom playlist with fine-tuned filters."""
+    """Generate a custom playlist with fine-tuned filters including audio features."""
     from .services.custom_playlist import generate_custom_playlist
-    
+
     genre_list = [g.strip() for g in genres.split(",") if g.strip()]
-    exclude_list = [g.strip() for g in exclude_genres.split(",") if g.strip()]
-    
+    exclude_genre_list = [g.strip() for g in exclude_genres.split(",") if g.strip()]
+    exclude_artist_list = [a.strip() for a in exclude_artists.split(",") if a.strip()]
+
     return generate_custom_playlist(
         genres=genre_list,
-        exclude_genres=exclude_list,
+        exclude_genres=exclude_genre_list,
         min_plays=min_plays,
         max_days=max_days,
         discovery_ratio=discovery_ratio,
         artist_filter=artist_filter,
         limit=limit,
+        energy_min=energy_min,
+        energy_max=energy_max,
+        valence_min=valence_min,
+        valence_max=valence_max,
+        danceability_min=danceability_min,
+        danceability_max=danceability_max,
+        tempo_min=tempo_min,
+        tempo_max=tempo_max,
+        acousticness_min=acousticness_min,
+        acousticness_max=acousticness_max,
+        year_min=year_min,
+        year_max=year_max,
+        exclude_artists=exclude_artist_list,
     )
 
 

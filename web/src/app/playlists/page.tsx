@@ -4,6 +4,7 @@ import { useState, useMemo } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import { getTopGenres, getTopArtists, createPlaylist } from '@/lib/api';
 import TrackCard from '@/components/TrackCard';
+import RangeSlider from '@/components/RangeSlider';
 import axios from 'axios';
 
 interface PlaylistFilters {
@@ -14,6 +15,13 @@ interface PlaylistFilters {
   discoveryRatio: number; // 0 = all from history, 100 = all new
   artistFilter: 'all' | 'top' | 'diverse';
   limit: number;
+  // Audio features (null means not filtering)
+  energyRange: [number, number] | null;
+  valenceRange: [number, number] | null;
+  danceabilityRange: [number, number] | null;
+  tempoRange: [number, number] | null;
+  acousticnessRange: [number, number] | null;
+  excludeArtists: string[];
 }
 
 const api = axios.create({ baseURL: 'http://127.0.0.1:8000/api' });
@@ -27,7 +35,16 @@ export default function PlaylistsPage() {
     discoveryRatio: 30, // 30% new music by default
     artistFilter: 'all',
     limit: 30,
+    // Audio features - null by default (no filter)
+    energyRange: null,
+    valenceRange: null,
+    danceabilityRange: null,
+    tempoRange: null,
+    acousticnessRange: null,
+    excludeArtists: [],
   });
+
+  const [showAudioFeatures, setShowAudioFeatures] = useState(false);
   
   const [playlistName, setPlaylistName] = useState('My Custom Mix');
 
@@ -52,7 +69,32 @@ export default function PlaylistsPage() {
       params.set('discovery_ratio', filters.discoveryRatio.toString());
       params.set('artist_filter', filters.artistFilter);
       params.set('limit', filters.limit.toString());
-      
+
+      // Audio feature filters
+      if (filters.energyRange) {
+        params.set('energy_min', filters.energyRange[0].toString());
+        params.set('energy_max', filters.energyRange[1].toString());
+      }
+      if (filters.valenceRange) {
+        params.set('valence_min', filters.valenceRange[0].toString());
+        params.set('valence_max', filters.valenceRange[1].toString());
+      }
+      if (filters.danceabilityRange) {
+        params.set('danceability_min', filters.danceabilityRange[0].toString());
+        params.set('danceability_max', filters.danceabilityRange[1].toString());
+      }
+      if (filters.tempoRange) {
+        params.set('tempo_min', filters.tempoRange[0].toString());
+        params.set('tempo_max', filters.tempoRange[1].toString());
+      }
+      if (filters.acousticnessRange) {
+        params.set('acousticness_min', filters.acousticnessRange[0].toString());
+        params.set('acousticness_max', filters.acousticnessRange[1].toString());
+      }
+      if (filters.excludeArtists.length > 0) {
+        params.set('exclude_artists', filters.excludeArtists.join(','));
+      }
+
       const res = await api.get(`/recommendations/custom?${params.toString()}`);
       return res.data;
     },
@@ -247,6 +289,145 @@ export default function PlaylistsPage() {
               {filters.discoveryRatio === 100 && "All new music based on your taste"}
             </p>
           </div>
+
+          {/* Audio Features Toggle */}
+          <button
+            onClick={() => setShowAudioFeatures(!showAudioFeatures)}
+            className="w-full glass-card p-4 text-left flex items-center justify-between hover:bg-[var(--bg-card-hover)] transition-colors"
+          >
+            <span className="text-sm font-medium text-[var(--text-secondary)]">
+              Audio Features
+            </span>
+            <div className="flex items-center gap-2">
+              {(filters.energyRange || filters.valenceRange || filters.danceabilityRange || filters.tempoRange || filters.acousticnessRange) && (
+                <span className="text-xs bg-[var(--accent-primary)]/20 text-[var(--accent-primary)] px-2 py-1 rounded">
+                  Active
+                </span>
+              )}
+              <svg
+                className={`w-5 h-5 text-[var(--text-muted)] transition-transform ${showAudioFeatures ? 'rotate-180' : ''}`}
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </div>
+          </button>
+
+          {/* Audio Feature Sliders */}
+          {showAudioFeatures && (
+            <div className="space-y-3">
+              <RangeSlider
+                label="Energy"
+                description="Low = calm, High = intense"
+                min={0}
+                max={100}
+                value={filters.energyRange}
+                onChange={(v) => setFilters(f => ({ ...f, energyRange: v }))}
+              />
+
+              <RangeSlider
+                label="Mood"
+                description="Low = sad/dark, High = happy/upbeat"
+                min={0}
+                max={100}
+                value={filters.valenceRange}
+                onChange={(v) => setFilters(f => ({ ...f, valenceRange: v }))}
+              />
+
+              <RangeSlider
+                label="Danceability"
+                description="How suitable for dancing"
+                min={0}
+                max={100}
+                value={filters.danceabilityRange}
+                onChange={(v) => setFilters(f => ({ ...f, danceabilityRange: v }))}
+              />
+
+              <RangeSlider
+                label="Tempo"
+                description="Speed in BPM"
+                min={60}
+                max={200}
+                step={5}
+                unit=" BPM"
+                value={filters.tempoRange}
+                onChange={(v) => setFilters(f => ({ ...f, tempoRange: v }))}
+              />
+
+              <RangeSlider
+                label="Acousticness"
+                description="Low = electronic, High = acoustic"
+                min={0}
+                max={100}
+                value={filters.acousticnessRange}
+                onChange={(v) => setFilters(f => ({ ...f, acousticnessRange: v }))}
+              />
+
+              {/* Clear all audio filters */}
+              {(filters.energyRange || filters.valenceRange || filters.danceabilityRange || filters.tempoRange || filters.acousticnessRange) && (
+                <button
+                  onClick={() => setFilters(f => ({
+                    ...f,
+                    energyRange: null,
+                    valenceRange: null,
+                    danceabilityRange: null,
+                    tempoRange: null,
+                    acousticnessRange: null,
+                  }))}
+                  className="w-full text-sm text-[var(--text-muted)] hover:text-[var(--accent-primary)] py-2"
+                >
+                  Clear all audio filters
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Exclude Artists */}
+          {topArtists && topArtists.length > 0 && (
+            <div className="glass-card p-4">
+              <label className="block text-sm font-medium text-[var(--text-secondary)] mb-2">
+                Exclude Artists
+              </label>
+              {filters.excludeArtists.length > 0 && (
+                <div className="flex flex-wrap gap-1 mb-3">
+                  {filters.excludeArtists.map(a => (
+                    <button
+                      key={a}
+                      onClick={() => setFilters(f => ({
+                        ...f,
+                        excludeArtists: f.excludeArtists.filter(x => x !== a)
+                      }))}
+                      className="px-2 py-1 text-xs rounded-full bg-red-500/20 text-red-400 hover:bg-red-500/30"
+                    >
+                      {a} ×
+                    </button>
+                  ))}
+                </div>
+              )}
+              <select
+                value=""
+                onChange={(e) => {
+                  if (e.target.value && !filters.excludeArtists.includes(e.target.value)) {
+                    setFilters(f => ({
+                      ...f,
+                      excludeArtists: [...f.excludeArtists, e.target.value]
+                    }));
+                  }
+                }}
+                className="w-full px-3 py-2 bg-[var(--bg-secondary)] border border-white/10 rounded-lg text-[var(--text-primary)] text-sm"
+              >
+                <option value="">Add artist to exclude...</option>
+                {topArtists
+                  .filter(a => !filters.excludeArtists.includes(a.artist))
+                  .map(a => (
+                    <option key={a.artist} value={a.artist}>{a.artist}</option>
+                  ))
+                }
+              </select>
+            </div>
+          )}
         </div>
 
         {/* Genre Selection */}
@@ -377,6 +558,12 @@ export default function PlaylistsPage() {
                     spotifyUrl={track.spotify_url}
                     subtitle={track.source === 'discovery' ? `New · via ${track.discovered_via || 'search'}` : `${track.play_count} plays`}
                     index={i}
+                    energy={track.energy}
+                    valence={track.valence}
+                    danceability={track.danceability}
+                    tempo={track.tempo}
+                    acousticness={track.acousticness}
+                    showFeatures={!!(filters.energyRange || filters.valenceRange || filters.danceabilityRange || filters.tempoRange || filters.acousticnessRange)}
                   />
                 ))}
               </div>
