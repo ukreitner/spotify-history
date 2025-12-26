@@ -40,7 +40,7 @@ if "genre" not in cols:
 oauth = SpotifyOAuth(
     client_id=os.getenv("SPOTIFY_CLIENT_ID"),
     client_secret=os.getenv("SPOTIFY_CLIENT_SECRET"),
-    redirect_uri="http://localhost:8888/callback",
+    redirect_uri="http://127.0.0.1:8888/callback",
     scope="user-read-recently-played",
     cache_path="/tmp/.spotify-cache",
 )
