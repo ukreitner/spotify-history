@@ -11,7 +11,7 @@ interface PlaylistFilters {
   excludeGenres: string[];
   minPlays: number;
   maxDaysSincePlay: number;
-  includeUnplayed: boolean;
+  discoveryRatio: number; // 0 = all from history, 100 = all new
   artistFilter: 'all' | 'top' | 'diverse';
   limit: number;
 }
@@ -24,7 +24,7 @@ export default function PlaylistsPage() {
     excludeGenres: [],
     minPlays: 1,
     maxDaysSincePlay: 365,
-    includeUnplayed: false,
+    discoveryRatio: 30, // 30% new music by default
     artistFilter: 'all',
     limit: 30,
   });
@@ -49,7 +49,7 @@ export default function PlaylistsPage() {
       if (filters.excludeGenres.length > 0) params.set('exclude_genres', filters.excludeGenres.join(','));
       params.set('min_plays', filters.minPlays.toString());
       params.set('max_days', filters.maxDaysSincePlay.toString());
-      params.set('include_unplayed', filters.includeUnplayed.toString());
+      params.set('discovery_ratio', filters.discoveryRatio.toString());
       params.set('artist_filter', filters.artistFilter);
       params.set('limit', filters.limit.toString());
       
@@ -222,20 +222,30 @@ export default function PlaylistsPage() {
             </div>
           </div>
 
-          {/* Include Spotify Search */}
+          {/* Discovery Ratio */}
           <div className="glass-card p-4">
-            <label className="flex items-center gap-3 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={filters.includeUnplayed}
-                onChange={(e) => setFilters(f => ({ ...f, includeUnplayed: e.target.checked }))}
-                className="w-5 h-5 accent-[var(--accent-primary)] rounded"
-              />
-              <div>
-                <div className="font-medium text-sm">Include new discoveries</div>
-                <div className="text-xs text-[var(--text-muted)]">Add tracks from Spotify you haven't heard</div>
-              </div>
+            <label className="block text-sm font-medium text-[var(--text-secondary)] mb-2">
+              New Music: {filters.discoveryRatio}%
             </label>
+            <input
+              type="range"
+              min="0"
+              max="100"
+              step="10"
+              value={filters.discoveryRatio}
+              onChange={(e) => setFilters(f => ({ ...f, discoveryRatio: parseInt(e.target.value) }))}
+              className="w-full accent-[var(--accent-primary)]"
+            />
+            <div className="flex justify-between text-xs text-[var(--text-muted)] mt-1">
+              <span>All familiar</span>
+              <span>All new</span>
+            </div>
+            <p className="text-xs text-[var(--text-muted)] mt-2">
+              {filters.discoveryRatio === 0 && "Only tracks from your listening history"}
+              {filters.discoveryRatio > 0 && filters.discoveryRatio < 50 && "Mostly familiar with some discoveries"}
+              {filters.discoveryRatio >= 50 && filters.discoveryRatio < 100 && "Good mix of familiar and new"}
+              {filters.discoveryRatio === 100 && "All new music based on your taste"}
+            </p>
           </div>
         </div>
 
@@ -365,7 +375,7 @@ export default function PlaylistsPage() {
                     imageUrl={track.image_url}
                     previewUrl={track.preview_url}
                     spotifyUrl={track.spotify_url}
-                    subtitle={track.play_count ? `${track.play_count} plays` : undefined}
+                    subtitle={track.source === 'discovery' ? `New · via ${track.discovered_via || 'search'}` : `${track.play_count} plays`}
                     index={i}
                   />
                 ))}

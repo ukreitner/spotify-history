@@ -145,7 +145,7 @@ def recommendations_custom(
     exclude_genres: str = "",
     min_plays: int = 1,
     max_days: int = 365,
-    include_unplayed: bool = False,
+    discovery_ratio: int = 30,
     artist_filter: str = "all",
     limit: int = 30,
 ):
@@ -160,7 +160,7 @@ def recommendations_custom(
         exclude_genres=exclude_list,
         min_plays=min_plays,
         max_days=max_days,
-        include_unplayed=include_unplayed,
+        discovery_ratio=discovery_ratio,
         artist_filter=artist_filter,
         limit=limit,
     )
