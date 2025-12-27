@@ -203,8 +203,87 @@ export const getAvailableMoods = () =>
   api.get<Mood[]>('/recommendations/moods').then(r => r.data);
 
 export const createPlaylist = (name: string, trackIds: string[], description = '') =>
-  api.post<{ id: string; name: string; url: string }>('/playlists/create', { 
-    name, 
+  api.post<{ id: string; name: string; url: string }>('/playlists/create', {
+    name,
     track_ids: trackIds,
-    description 
+    description
   }).then(r => r.data);
+
+// === Vibe Playlist Types ===
+
+export interface VibeTrack {
+  track_id: string;
+  track: string;
+  artist: string;
+  image_url?: string | null;
+  preview_url?: string | null;
+  spotify_url?: string | null;
+  source: 'history' | 'discovery' | 'unknown';
+  discovered_via?: string | null;
+  coherence_score: number;
+  energy?: number | null;
+  valence?: number | null;
+  tempo?: number | null;
+  play_count: number;
+}
+
+export interface VibeProfile {
+  anchor_count: number;
+  has_audio_features: boolean;
+  top_genres: string[];
+  target_energy?: number | null;
+  target_valence?: number | null;
+  target_tempo?: number | null;
+}
+
+export interface FlowStats {
+  avg_transition_cost: number;
+  max_transition_cost: number;
+  smooth_transitions: number;
+  jarring_transitions: number;
+  total_transitions: number;
+}
+
+export interface VibePlaylistResult {
+  tracks: VibeTrack[];
+  vibe_profile: VibeProfile;
+  flow_stats: FlowStats;
+  counts: {
+    history: number;
+    discovery: number;
+    total: number;
+  };
+}
+
+export interface AnchorTrack {
+  track_id: string;
+  track: string;
+  artist: string;
+  image_url?: string | null;
+  source: 'recent' | 'history' | 'spotify';
+  play_count?: number;
+}
+
+export type FlowMode = 'smooth' | 'energy_arc' | 'shuffle';
+
+// === Vibe Playlist API Calls ===
+
+export interface VibePlaylistRequest {
+  anchor_track_ids: string[];
+  track_count?: number;
+  discovery_ratio?: number;
+  flow_mode?: FlowMode;
+  exclude_artists?: string[];
+}
+
+export const generateVibePlaylist = (request: VibePlaylistRequest) =>
+  api.post<VibePlaylistResult>('/recommendations/vibe', request).then(r => r.data);
+
+export const searchSpotifyTracks = (query: string, limit = 20) =>
+  api.get<AnchorTrack[]>('/tracks/search', { params: { q: query, limit } }).then(r => r.data);
+
+export const getRecentTracks = (days = 7, limit = 20) =>
+  api.get<AnchorTrack[]>('/tracks/recent', { params: { days, limit } }).then(r => r.data);
+
+export const searchHistoryTracks = (query: string, limit = 20) =>
+  api.get<AnchorTrack[]>('/tracks/history/search', { params: { q: query, limit } }).then(r => r.data);

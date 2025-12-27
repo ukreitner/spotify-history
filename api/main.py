@@ -7,8 +7,10 @@ from .services.analyzer import (
     get_overview, get_overview_split, get_top_artists_stats, get_top_genres_stats,
     get_listening_patterns, get_listening_streaks
 )
-from .db import get_top_tracks
-from .spotify_client import enrich_tracks_with_spotify_data
+from .db import get_top_tracks, search_user_tracks, get_recent_tracks
+from .spotify_client import (
+    enrich_tracks_with_spotify_data, create_playlist, search_tracks_advanced
+)
 from .services.forgotten_gems import find_forgotten_gems
 from .services.discover import discover_new_artists
 from .services.mood import generate_mood_playlist, get_available_moods
@@ -16,7 +18,6 @@ from .services.podcasts import (
     get_podcast_stats, get_top_shows, get_show_episodes,
     get_recently_played_episodes, get_podcast_backlog
 )
-from .spotify_client import create_playlist
 
 app = FastAPI(title="Spotify History Recommendations", version="2.0.0")
 
@@ -217,3 +218,93 @@ def playlists_create(request: CreatePlaylistRequest):
 def health():
     """Health check."""
     return {"status": "ok"}
+
+
+# === NEW VIBE-BASED PLAYLIST ENDPOINTS ===
+
+class VibePlaylistRequest(BaseModel):
+    anchor_track_ids: List[str]
+    track_count: int = 30
+    discovery_ratio: int = 50
+    flow_mode: str = "smooth"  # smooth, energy_arc, shuffle
+    exclude_artists: List[str] = []
+
+
+@app.post("/api/recommendations/vibe")
+def recommendations_vibe(request: VibePlaylistRequest):
+    """
+    Generate a coherent playlist based on anchor tracks.
+
+    Select 1-5 anchor tracks that define the vibe you want.
+    The algorithm finds similar tracks from your history and new discoveries.
+    """
+    from .services.custom_playlist import generate_vibe_playlist
+
+    if not request.anchor_track_ids:
+        raise HTTPException(status_code=400, detail="Need at least 1 anchor track")
+    if len(request.anchor_track_ids) > 5:
+        raise HTTPException(status_code=400, detail="Maximum 5 anchor tracks")
+    if request.flow_mode not in ("smooth", "energy_arc", "shuffle"):
+        raise HTTPException(status_code=400, detail="Invalid flow mode")
+
+    try:
+        return generate_vibe_playlist(
+            anchor_track_ids=request.anchor_track_ids,
+            track_count=request.track_count,
+            discovery_ratio=request.discovery_ratio,
+            flow_mode=request.flow_mode,
+            exclude_artists=request.exclude_artists,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/tracks/search")
+def tracks_search(q: str, limit: int = 20):
+    """
+    Search Spotify for tracks by name or artist.
+
+    Use this to find anchor tracks from any song on Spotify.
+    """
+    if not q or len(q) < 2:
+        raise HTTPException(status_code=400, detail="Query must be at least 2 characters")
+
+    tracks = search_tracks_advanced(q, limit=limit)
+
+    # Format for frontend
+    return [
+        {
+            "track_id": t.get("id"),
+            "track": t.get("name"),
+            "artist": ", ".join(a.get("name", "") for a in t.get("artists", [])),
+            "image_url": (t.get("album", {}).get("images", [{}])[0].get("url")
+                         if t.get("album", {}).get("images") else None),
+            "source": "spotify",
+        }
+        for t in tracks if t and t.get("id")
+    ]
+
+
+@app.get("/api/tracks/recent")
+def tracks_recent(days: int = 7, limit: int = 20):
+    """
+    Get recently played tracks from your history.
+
+    Great for picking anchor tracks based on what you've been listening to.
+    """
+    tracks = get_recent_tracks(days=days, limit=limit)
+    return enrich_tracks_with_spotify_data(tracks)
+
+
+@app.get("/api/tracks/history/search")
+def tracks_history_search(q: str, limit: int = 20):
+    """
+    Search your listening history for tracks.
+
+    Searches track names and artist names.
+    """
+    if not q or len(q) < 2:
+        raise HTTPException(status_code=400, detail="Query must be at least 2 characters")
+
+    tracks = search_user_tracks(q, limit=limit)
+    return enrich_tracks_with_spotify_data(tracks)

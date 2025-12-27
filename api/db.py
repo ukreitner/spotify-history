@@ -117,8 +117,11 @@ def get_total_plays(content_type: ContentType = "all") -> int:
     total = 0
     for db_path in get_all_db_paths():
         with connect(db_path) as conn:
-            count = conn.execute(f"SELECT COUNT(*) FROM plays WHERE {filter_sql}").fetchone()[0]
-            total += count
+            try:
+                count = conn.execute(f"SELECT COUNT(*) FROM plays WHERE {filter_sql}").fetchone()[0]
+                total += count
+            except sqlite3.OperationalError:
+                continue
     return total
 
 
@@ -128,8 +131,11 @@ def get_unique_artists(content_type: ContentType = "all") -> int:
     artists = set()
     for db_path in get_all_db_paths():
         with connect(db_path) as conn:
-            rows = conn.execute(f"SELECT DISTINCT artist FROM plays WHERE {filter_sql}").fetchall()
-            artists.update(row[0] for row in rows)
+            try:
+                rows = conn.execute(f"SELECT DISTINCT artist FROM plays WHERE {filter_sql}").fetchall()
+                artists.update(row[0] for row in rows)
+            except sqlite3.OperationalError:
+                continue
     return len(artists)
 
 
@@ -139,8 +145,11 @@ def get_unique_tracks(content_type: ContentType = "all") -> int:
     tracks = set()
     for db_path in get_all_db_paths():
         with connect(db_path) as conn:
-            rows = conn.execute(f"SELECT DISTINCT track_id FROM plays WHERE track_id IS NOT NULL AND {filter_sql}").fetchall()
-            tracks.update(row[0] for row in rows if row[0])
+            try:
+                rows = conn.execute(f"SELECT DISTINCT track_id FROM plays WHERE track_id IS NOT NULL AND {filter_sql}").fetchall()
+                tracks.update(row[0] for row in rows if row[0])
+            except sqlite3.OperationalError:
+                continue
     return len(tracks)
 
 
@@ -150,11 +159,14 @@ def get_top_artists(limit: int = 20, content_type: ContentType = "all") -> List[
     artist_counts: Dict[str, int] = {}
     for db_path in get_all_db_paths():
         with connect(db_path) as conn:
-            rows = conn.execute(
-                f"SELECT artist, COUNT(*) as count FROM plays WHERE {filter_sql} GROUP BY artist"
-            ).fetchall()
-            for row in rows:
-                artist_counts[row["artist"]] = artist_counts.get(row["artist"], 0) + row["count"]
+            try:
+                rows = conn.execute(
+                    f"SELECT artist, COUNT(*) as count FROM plays WHERE {filter_sql} GROUP BY artist"
+                ).fetchall()
+                for row in rows:
+                    artist_counts[row["artist"]] = artist_counts.get(row["artist"], 0) + row["count"]
+            except sqlite3.OperationalError:
+                continue
 
     sorted_artists = sorted(artist_counts.items(), key=lambda x: x[1], reverse=True)
     return [{"artist": a, "play_count": c} for a, c in sorted_artists[:limit]]
@@ -166,12 +178,15 @@ def get_top_genres(limit: int = 20, content_type: ContentType = "all") -> List[D
     genre_counts: Dict[str, int] = {}
     for db_path in get_all_db_paths():
         with connect(db_path) as conn:
-            rows = conn.execute(f"SELECT genre FROM plays WHERE genre != '' AND {filter_sql}").fetchall()
-            for row in rows:
-                for genre in row["genre"].split(", "):
-                    genre = genre.strip()
-                    if genre:
-                        genre_counts[genre] = genre_counts.get(genre, 0) + 1
+            try:
+                rows = conn.execute(f"SELECT genre FROM plays WHERE genre != '' AND {filter_sql}").fetchall()
+                for row in rows:
+                    for genre in row["genre"].split(", "):
+                        genre = genre.strip()
+                        if genre:
+                            genre_counts[genre] = genre_counts.get(genre, 0) + 1
+            except sqlite3.OperationalError:
+                continue
 
     sorted_genres = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)
     return [{"genre": g, "play_count": c} for g, c in sorted_genres[:limit]]
@@ -191,28 +206,31 @@ def get_all_tracks_with_counts(content_type: ContentType = "all") -> Dict[str, D
     tracks: Dict[str, Dict] = {}
     for db_path in get_all_db_paths():
         with connect(db_path) as conn:
-            rows = conn.execute(
-                f"SELECT track_id, track, artist, COUNT(*) as count, "
-                f"MAX(played_at) as last_played, MIN(played_at) as first_played "
-                f"FROM plays WHERE track_id IS NOT NULL AND {filter_sql} GROUP BY track_id"
-            ).fetchall()
-            for row in rows:
-                tid = row["track_id"]
-                if tid in tracks:
-                    tracks[tid]["play_count"] += row["count"]
-                    if row["last_played"] > tracks[tid]["last_played"]:
-                        tracks[tid]["last_played"] = row["last_played"]
-                    if row["first_played"] < tracks[tid]["first_played"]:
-                        tracks[tid]["first_played"] = row["first_played"]
-                else:
-                    tracks[tid] = {
-                        "track_id": tid,
-                        "track": row["track"],
-                        "artist": row["artist"],
-                        "play_count": row["count"],
-                        "last_played": row["last_played"],
-                        "first_played": row["first_played"],
-                    }
+            try:
+                rows = conn.execute(
+                    f"SELECT track_id, track, artist, COUNT(*) as count, "
+                    f"MAX(played_at) as last_played, MIN(played_at) as first_played "
+                    f"FROM plays WHERE track_id IS NOT NULL AND {filter_sql} GROUP BY track_id"
+                ).fetchall()
+                for row in rows:
+                    tid = row["track_id"]
+                    if tid in tracks:
+                        tracks[tid]["play_count"] += row["count"]
+                        if row["last_played"] > tracks[tid]["last_played"]:
+                            tracks[tid]["last_played"] = row["last_played"]
+                        if row["first_played"] < tracks[tid]["first_played"]:
+                            tracks[tid]["first_played"] = row["first_played"]
+                    else:
+                        tracks[tid] = {
+                            "track_id": tid,
+                            "track": row["track"],
+                            "artist": row["artist"],
+                            "play_count": row["count"],
+                            "last_played": row["last_played"],
+                            "first_played": row["first_played"],
+                        }
+            except sqlite3.OperationalError:
+                continue
     return tracks
 
 
@@ -222,8 +240,11 @@ def get_all_artist_ids(content_type: ContentType = "all") -> Set[str]:
     artist_names: Set[str] = set()
     for db_path in get_all_db_paths():
         with connect(db_path) as conn:
-            rows = conn.execute(f"SELECT DISTINCT artist FROM plays WHERE {filter_sql}").fetchall()
-            artist_names.update(row[0] for row in rows)
+            try:
+                rows = conn.execute(f"SELECT DISTINCT artist FROM plays WHERE {filter_sql}").fetchall()
+                artist_names.update(row[0] for row in rows)
+            except sqlite3.OperationalError:
+                continue
     return artist_names
 
 
@@ -238,13 +259,16 @@ def get_podcast_episodes(show: str, limit: int = 50) -> List[Dict]:
     episodes = []
     for db_path in get_all_db_paths():
         with connect(db_path) as conn:
-            rows = conn.execute(
-                "SELECT track as episode, COUNT(*) as play_count, MAX(played_at) as last_played "
-                "FROM plays WHERE LOWER(artist) = LOWER(?) GROUP BY track ORDER BY last_played DESC",
-                (show,)
-            ).fetchall()
-            for row in rows:
-                episodes.append(dict(row))
+            try:
+                rows = conn.execute(
+                    "SELECT track as episode, COUNT(*) as play_count, MAX(played_at) as last_played "
+                    "FROM plays WHERE LOWER(artist) = LOWER(?) GROUP BY track ORDER BY last_played DESC",
+                    (show,)
+                ).fetchall()
+                for row in rows:
+                    episodes.append(dict(row))
+            except sqlite3.OperationalError:
+                continue
 
     # Dedupe and sort
     seen = set()
@@ -278,10 +302,13 @@ def get_all_plays_with_timestamps(content_type: ContentType = "all") -> List[str
     timestamps = []
     for db_path in get_all_db_paths():
         with connect(db_path) as conn:
-            rows = conn.execute(
-                f"SELECT played_at FROM plays WHERE {filter_sql}"
-            ).fetchall()
-            timestamps.extend(row[0] for row in rows if row[0])
+            try:
+                rows = conn.execute(
+                    f"SELECT played_at FROM plays WHERE {filter_sql}"
+                ).fetchall()
+                timestamps.extend(row[0] for row in rows if row[0])
+            except sqlite3.OperationalError:
+                continue
     return timestamps
 
 
@@ -289,25 +316,171 @@ def get_top_tracks(limit: int = 20, content_type: ContentType = "all") -> List[D
     """Get top tracks by play count across all databases."""
     filter_sql = get_content_filter_sql(content_type)
     track_data: Dict[str, Dict] = {}
-    
+
     for db_path in get_all_db_paths():
         with connect(db_path) as conn:
-            rows = conn.execute(
-                f"SELECT track_id, track, artist, COUNT(*) as count "
-                f"FROM plays WHERE track_id IS NOT NULL AND {filter_sql} "
-                f"GROUP BY track_id"
-            ).fetchall()
-            for row in rows:
-                tid = row["track_id"]
-                if tid in track_data:
-                    track_data[tid]["play_count"] += row["count"]
-                else:
-                    track_data[tid] = {
-                        "track_id": tid,
-                        "track": row["track"],
-                        "artist": row["artist"],
-                        "play_count": row["count"],
-                    }
-    
+            try:
+                rows = conn.execute(
+                    f"SELECT track_id, track, artist, COUNT(*) as count "
+                    f"FROM plays WHERE track_id IS NOT NULL AND {filter_sql} "
+                    f"GROUP BY track_id"
+                ).fetchall()
+                for row in rows:
+                    tid = row["track_id"]
+                    if tid in track_data:
+                        track_data[tid]["play_count"] += row["count"]
+                    else:
+                        track_data[tid] = {
+                            "track_id": tid,
+                            "track": row["track"],
+                            "artist": row["artist"],
+                            "play_count": row["count"],
+                        }
+            except sqlite3.OperationalError:
+                continue
+
     sorted_tracks = sorted(track_data.values(), key=lambda x: x["play_count"], reverse=True)
+    return sorted_tracks[:limit]
+
+
+def get_recent_listening(days: int = 30, content_type: ContentType = "music") -> Dict:
+    """
+    Analyze recent listening patterns.
+    Returns artists, tracks, and genres from the last N days with play counts.
+    """
+    from datetime import datetime, timedelta
+
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    filter_sql = get_content_filter_sql(content_type)
+
+    artists: Dict[str, int] = {}
+    tracks: Dict[str, Dict] = {}
+    genres: Dict[str, int] = {}
+
+    for db_path in get_all_db_paths():
+        with connect(db_path) as conn:
+            try:
+                rows = conn.execute(
+                    f"SELECT track_id, track, artist, genre, played_at FROM plays "
+                    f"WHERE played_at > ? AND {filter_sql}",
+                    (cutoff,)
+                ).fetchall()
+
+                for row in rows:
+                    # Count artists
+                    artist = row["artist"].split(",")[0].strip()
+                    artists[artist] = artists.get(artist, 0) + 1
+
+                    # Count tracks
+                    tid = row["track_id"]
+                    if tid:
+                        if tid not in tracks:
+                            tracks[tid] = {
+                                "track_id": tid,
+                                "track": row["track"],
+                                "artist": row["artist"],
+                                "play_count": 0,
+                            }
+                        tracks[tid]["play_count"] += 1
+
+                    # Count genres
+                    if row["genre"]:
+                        for g in row["genre"].split(", "):
+                            g = g.strip()
+                            if g:
+                                genres[g] = genres.get(g, 0) + 1
+
+            except sqlite3.OperationalError:
+                continue
+
+    # Sort by play count
+    sorted_artists = sorted(artists.items(), key=lambda x: x[1], reverse=True)
+    sorted_tracks = sorted(tracks.values(), key=lambda x: x["play_count"], reverse=True)
+    sorted_genres = sorted(genres.items(), key=lambda x: x[1], reverse=True)
+
+    return {
+        "artists": [{"artist": a, "play_count": c} for a, c in sorted_artists],
+        "tracks": sorted_tracks,
+        "genres": [{"genre": g, "play_count": c} for g, c in sorted_genres],
+        "total_plays": sum(artists.values()),
+    }
+
+
+def search_user_tracks(query: str, limit: int = 20) -> List[Dict]:
+    """
+    Search user's listening history for tracks matching query.
+
+    Searches track name and artist name.
+    Returns tracks sorted by play count.
+    """
+    query_lower = query.lower()
+    results: Dict[str, Dict] = {}
+
+    for db_path in get_all_db_paths():
+        with connect(db_path) as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT track_id, track, artist, COUNT(*) as count "
+                    "FROM plays WHERE track_id IS NOT NULL "
+                    "AND (LOWER(track) LIKE ? OR LOWER(artist) LIKE ?) "
+                    "GROUP BY track_id",
+                    (f"%{query_lower}%", f"%{query_lower}%")
+                ).fetchall()
+
+                for row in rows:
+                    tid = row["track_id"]
+                    if tid in results:
+                        results[tid]["play_count"] += row["count"]
+                    else:
+                        results[tid] = {
+                            "track_id": tid,
+                            "track": row["track"],
+                            "artist": row["artist"],
+                            "play_count": row["count"],
+                        }
+            except sqlite3.OperationalError:
+                continue
+
+    sorted_results = sorted(results.values(), key=lambda x: x["play_count"], reverse=True)
+    return sorted_results[:limit]
+
+
+def get_recent_tracks(days: int = 7, limit: int = 20, content_type: ContentType = "music") -> List[Dict]:
+    """
+    Get most recently played tracks.
+
+    Returns tracks from the last N days, sorted by most recent first.
+    """
+    from datetime import datetime, timedelta
+
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    filter_sql = get_content_filter_sql(content_type)
+    tracks: Dict[str, Dict] = {}
+
+    for db_path in get_all_db_paths():
+        with connect(db_path) as conn:
+            try:
+                rows = conn.execute(
+                    f"SELECT track_id, track, artist, played_at "
+                    f"FROM plays WHERE track_id IS NOT NULL "
+                    f"AND played_at > ? AND {filter_sql} "
+                    f"ORDER BY played_at DESC",
+                    (cutoff,)
+                ).fetchall()
+
+                for row in rows:
+                    tid = row["track_id"]
+                    if tid not in tracks:
+                        tracks[tid] = {
+                            "track_id": tid,
+                            "track": row["track"],
+                            "artist": row["artist"],
+                            "last_played": row["played_at"],
+                            "play_count": 0,
+                        }
+                    tracks[tid]["play_count"] += 1
+            except sqlite3.OperationalError:
+                continue
+
+    sorted_tracks = sorted(tracks.values(), key=lambda x: x["last_played"], reverse=True)
     return sorted_tracks[:limit]

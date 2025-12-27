@@ -1,13 +1,24 @@
 from typing import Optional, List, Dict
+import time
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
-from functools import lru_cache
 from .config import SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REFRESH_TOKEN
 
 
-@lru_cache(maxsize=1)
+# Token cache with expiration tracking
+_token_cache: Dict = {}
+
+
 def get_spotify_client() -> spotipy.Spotify:
-    """Get authenticated Spotify client (cached)."""
+    """Get authenticated Spotify client with automatic token refresh."""
+    global _token_cache
+
+    # Check if we have a valid cached token (with 5 min buffer)
+    now = time.time()
+    if _token_cache and _token_cache.get("expires_at", 0) > now + 300:
+        return spotipy.Spotify(auth=_token_cache["access_token"])
+
+    # Refresh the token
     oauth = SpotifyOAuth(
         client_id=SPOTIFY_CLIENT_ID,
         client_secret=SPOTIFY_CLIENT_SECRET,
@@ -16,6 +27,7 @@ def get_spotify_client() -> spotipy.Spotify:
         cache_path="/tmp/.spotify-cache",
     )
     token = oauth.refresh_access_token(SPOTIFY_REFRESH_TOKEN)
+    _token_cache = token
     return spotipy.Spotify(auth=token["access_token"])
 
 
@@ -131,7 +143,13 @@ def search_artist(name: str) -> Optional[Dict]:
 
 
 def get_audio_features(track_ids: List[str]) -> List[Dict]:
-    """Get audio features for tracks (energy, valence, tempo, etc.)."""
+    """
+    Get audio features for tracks (energy, valence, tempo, etc.).
+
+    Note: As of late 2024, Spotify restricted audio_features API access.
+    This will return empty results if the app doesn't have Extended Quota Mode.
+    The playlist builder handles this gracefully with fallback scoring.
+    """
     sp = get_spotify_client()
     results = []
     valid_ids = [tid for tid in track_ids if tid]
@@ -139,10 +157,93 @@ def get_audio_features(track_ids: List[str]) -> List[Dict]:
         batch = valid_ids[i : i + 100]
         try:
             features = sp.audio_features(batch)
-            results.extend(f for f in features if f)
+            if features:
+                results.extend(f for f in features if f)
         except Exception:
-            continue
+            # Likely 403 due to Spotify API restrictions
+            pass
     return results
+
+
+def get_recommendations(
+    seed_artists: List[str] = None,
+    seed_tracks: List[str] = None,
+    seed_genres: List[str] = None,
+    limit: int = 50,
+    **kwargs
+) -> List[Dict]:
+    """
+    Get personalized track recommendations from Spotify.
+
+    Can use up to 5 seeds total (artists + tracks + genres).
+    kwargs can include target_* params like target_energy, target_valence, etc.
+    """
+    sp = get_spotify_client()
+    try:
+        results = sp.recommendations(
+            seed_artists=seed_artists or [],
+            seed_tracks=seed_tracks or [],
+            seed_genres=seed_genres or [],
+            limit=limit,
+            **kwargs
+        )
+        return results.get("tracks", [])
+    except Exception:
+        return []
+
+
+def get_artist_albums(artist_id: str, limit: int = 10) -> List[Dict]:
+    """Get albums for an artist (not just singles/compilations)."""
+    sp = get_spotify_client()
+    try:
+        results = sp.artist_albums(
+            artist_id,
+            album_type="album",
+            limit=limit
+        )
+        return results.get("items", [])
+    except Exception:
+        return []
+
+
+def get_album_tracks(album_id: str) -> List[Dict]:
+    """Get all tracks from an album."""
+    sp = get_spotify_client()
+    try:
+        results = sp.album_tracks(album_id, limit=50)
+        tracks = results.get("items", [])
+        # Get full track info with popularity
+        if tracks:
+            track_ids = [t["id"] for t in tracks if t.get("id")]
+            full_tracks = get_tracks_bulk(track_ids)
+            return full_tracks
+        return tracks
+    except Exception:
+        return []
+
+
+def search_tracks_advanced(
+    query: str,
+    limit: int = 50,
+    market: str = "US"
+) -> List[Dict]:
+    """Search tracks with full query flexibility."""
+    sp = get_spotify_client()
+    try:
+        results = sp.search(q=query, type="track", limit=limit, market=market)
+        return results.get("tracks", {}).get("items", [])
+    except Exception:
+        return []
+
+
+def get_new_releases(limit: int = 50, country: str = "US") -> List[Dict]:
+    """Get new album releases."""
+    sp = get_spotify_client()
+    try:
+        results = sp.new_releases(limit=limit, country=country)
+        return results.get("albums", {}).get("items", [])
+    except Exception:
+        return []
 
 
 def create_playlist(name: str, track_ids: List[str], description: str = "") -> Dict:
