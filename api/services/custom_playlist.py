@@ -10,6 +10,7 @@ from ..spotify_client import (
     get_recommendations, get_artist_related, get_artist_top_tracks, search_artist,
     get_artist_albums, get_album_tracks, get_tracks_bulk, get_artists_bulk
 )
+from ..lastfm_client import get_similar_artists
 from .vibe_profile import build_vibe_profile, VibeProfile, get_top_genres as vibe_top_genres
 from .coherence import compute_total_coherence, get_coherence_breakdown
 from .flow_ordering import order_playlist, FlowMode
@@ -680,26 +681,34 @@ def generate_vibe_playlist(
             for artist in track.get("artists", []):
                 anchor_artist_names.add(artist.get("name", "").lower())
 
-        # Strategy 1: Deep cuts from anchor artists (albums not just top tracks)
+        # Strategy 1: Deep cuts from anchor artists (LIMITED - we want NEW artists too)
+        anchor_artist_track_count = {}  # Track how many we add per anchor artist
+        MAX_PER_ANCHOR_ARTIST = 3  # Limit discovery from anchor artists
+
         for anchor_artist_id in list(profile.anchor_artist_ids)[:5]:
             # Get albums
-            albums = get_artist_albums(anchor_artist_id, limit=5)
+            albums = get_artist_albums(anchor_artist_id, limit=3)
             for album in albums:
                 album_tracks = get_album_tracks(album.get("id"))
                 # Sort by popularity to find hidden gems
                 album_tracks.sort(key=lambda t: t.get("popularity", 50) if t else 100)
-                for track in album_tracks[:5]:  # Deep cuts from each album
+                for track in album_tracks[:3]:  # Deep cuts from each album
                     if not track:
                         continue
                     tid = track.get("id")
                     if not tid or tid in existing_ids:
                         continue
 
+                    # Limit tracks per anchor artist
+                    if anchor_artist_track_count.get(anchor_artist_id, 0) >= MAX_PER_ANCHOR_ARTIST:
+                        break
+
                     track_artists = [a.get("name", "").lower() for a in track.get("artists", [])]
                     if any(a in exclude_lower for a in track_artists):
                         continue
 
                     existing_ids.add(tid)
+                    anchor_artist_track_count[anchor_artist_id] = anchor_artist_track_count.get(anchor_artist_id, 0) + 1
                     artist_name = track.get("artists", [{}])[0].get("name", "Unknown")
                     candidates.append({
                         "track": track,
@@ -710,93 +719,67 @@ def generate_vibe_playlist(
                         "via": f"deep cut · {artist_name}",
                     })
 
-            # Also get top tracks (more popular but still relevant)
-            top = get_artist_top_tracks(anchor_artist_id)
-            for track in top[:5]:
-                if not track:
+        # Strategy 2: Similar artists via Last.fm (Spotify API is restricted)
+        discovered_artist_count = {}  # Limit tracks per discovered artist
+        MAX_PER_DISCOVERED_ARTIST = 2
+
+        for anchor_name in list(anchor_artist_names)[:3]:
+            # Get similar artists from Last.fm
+            similar = get_similar_artists(anchor_name.title(), limit=15)
+
+            for sim_artist in similar:
+                sim_name = sim_artist.get("name", "")
+                if not sim_name:
                     continue
-                tid = track.get("id")
-                if not tid or tid in existing_ids:
+
+                # Skip if already at limit for this artist
+                if discovered_artist_count.get(sim_name.lower(), 0) >= MAX_PER_DISCOVERED_ARTIST:
                     continue
 
-                track_artists = [a.get("name", "").lower() for a in track.get("artists", [])]
-                if any(a in exclude_lower for a in track_artists):
+                # Skip if it's an anchor artist or excluded
+                if sim_name.lower() in anchor_artist_names or sim_name.lower() in exclude_lower:
                     continue
 
-                existing_ids.add(tid)
-                artist_name = track.get("artists", [{}])[0].get("name", "Unknown")
-                candidates.append({
-                    "track": track,
-                    "features": {},
-                    "genres": set(top_vibe_genres),
-                    "artist_ids": {a.get("id") for a in track.get("artists", []) if a.get("id")},
-                    "source": "discovery",
-                    "via": f"top track · {artist_name}",
-                })
+                # Find this artist on Spotify
+                spotify_artist = search_artist(sim_name)
+                if not spotify_artist:
+                    continue
 
-        # Strategy 2: Related artists (if API works)
-        for anchor_artist_id in list(profile.anchor_artist_ids)[:3]:
-            related = related_artists_map.get(anchor_artist_id, set())
-            for rel_id in list(related)[:5]:
-                # Get albums from related artist
-                albums = get_artist_albums(rel_id, limit=2)
-                for album in albums:
-                    album_tracks = get_album_tracks(album.get("id"))
-                    album_tracks.sort(key=lambda t: t.get("popularity", 50) if t else 100)
-                    for track in album_tracks[:3]:
-                        if not track:
-                            continue
-                        tid = track.get("id")
-                        if not tid or tid in existing_ids:
-                            continue
+                artist_id = spotify_artist.get("id")
+                if not artist_id:
+                    continue
 
-                        track_artists = [a.get("name", "").lower() for a in track.get("artists", [])]
-                        if any(a in exclude_lower for a in track_artists):
-                            continue
-
-                        existing_ids.add(tid)
-                        artist_name = track.get("artists", [{}])[0].get("name", "Unknown")
-                        candidates.append({
-                            "track": track,
-                            "features": {},
-                            "genres": set(),
-                            "artist_ids": {a.get("id") for a in track.get("artists", []) if a.get("id")},
-                            "source": "discovery",
-                            "via": f"similar · {artist_name}",
-                        })
-
-        # Strategy 3: Genre search (targeted with anchor info)
-        for genre in top_vibe_genres:
-            # Search with artist names to get similar music
-            for anchor_name in list(anchor_artist_names)[:2]:
-                query = f"genre:{genre}"
-                genre_tracks = search_tracks_by_genre(genre, limit=50)
-                # Prefer lower popularity tracks (hidden gems)
-                genre_tracks.sort(key=lambda t: t.get("popularity", 50))
-
-                for track in genre_tracks:
+                # Get top tracks from this similar artist
+                top_tracks = get_artist_top_tracks(artist_id)
+                for track in top_tracks[:3]:
+                    if not track:
+                        continue
                     tid = track.get("id")
                     if not tid or tid in existing_ids:
                         continue
+
+                    # Check limit
+                    if discovered_artist_count.get(sim_name.lower(), 0) >= MAX_PER_DISCOVERED_ARTIST:
+                        break
 
                     track_artists = [a.get("name", "").lower() for a in track.get("artists", [])]
                     if any(a in exclude_lower for a in track_artists):
                         continue
 
-                    # Skip if already know this artist well
-                    first_artist = track_artists[0] if track_artists else ""
-                    if first_artist in known_artist_names:
-                        continue
-
                     existing_ids.add(tid)
+                    discovered_artist_count[sim_name.lower()] = discovered_artist_count.get(sim_name.lower(), 0) + 1
+
                     candidates.append({
                         "track": track,
                         "features": {},
-                        "genres": {genre},
+                        "genres": set(top_vibe_genres),  # Inherit vibe genres
                         "artist_ids": {a.get("id") for a in track.get("artists", []) if a.get("id")},
                         "source": "discovery",
-                        "via": f"genre · {genre}",
+                        "via": f"similar to {anchor_name.title()}",
                     })
+
+        # NOTE: Removed generic genre search - it finds unrelated tracks
+        # Discovery now relies on: anchor artist deep cuts + related artists
 
         # Fetch audio features for discovery candidates without them
         discovery_without_features = [c for c in candidates if c["source"] == "discovery" and not c["features"]]
@@ -811,7 +794,7 @@ def generate_vibe_playlist(
     selected_artists: Dict[str, int] = {}
 
     # Minimum coherence threshold - filter out unrelated tracks
-    MIN_COHERENCE_THRESHOLD = 0.35
+    MIN_COHERENCE_THRESHOLD = 0.50
 
     for candidate in candidates:
         score = compute_total_coherence(
