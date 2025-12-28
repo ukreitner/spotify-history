@@ -21,6 +21,12 @@ export default function PlaylistsPage() {
   const [excludeArtists, setExcludeArtists] = useState<string[]>([]);
   const [excludeInput, setExcludeInput] = useState('');
 
+  // Advanced settings
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [coherenceThreshold, setCoherenceThreshold] = useState(50);
+  const [maxPerAnchorArtist, setMaxPerAnchorArtist] = useState(3);
+  const [maxPerSimilarArtist, setMaxPerSimilarArtist] = useState(2);
+
   const [result, setResult] = useState<VibePlaylistResult | null>(null);
 
   const generateMutation = useMutation({
@@ -31,6 +37,9 @@ export default function PlaylistsPage() {
         discovery_ratio: discoveryRatio,
         flow_mode: flowMode,
         exclude_artists: excludeArtists,
+        coherence_threshold: coherenceThreshold,
+        max_per_anchor_artist: maxPerAnchorArtist,
+        max_per_similar_artist: maxPerSimilarArtist,
       }),
     onSuccess: (data) => {
       setResult(data);
@@ -230,6 +239,87 @@ export default function PlaylistsPage() {
               </button>
             </div>
           </div>
+
+          {/* Advanced Settings Toggle */}
+          <button
+            onClick={() => setShowAdvanced(!showAdvanced)}
+            className="w-full flex items-center justify-between px-4 py-2 text-sm text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
+          >
+            <span>Advanced Settings</span>
+            <svg
+              className={`w-4 h-4 transition-transform ${showAdvanced ? 'rotate-180' : ''}`}
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
+
+          {/* Advanced Settings Panel */}
+          {showAdvanced && (
+            <div className="glass-card p-4 space-y-4">
+              {/* Coherence Threshold */}
+              <div>
+                <label className="block text-sm font-medium text-[var(--text-secondary)] mb-2">
+                  Strictness: {coherenceThreshold}%
+                </label>
+                <input
+                  type="range"
+                  min="20"
+                  max="80"
+                  step="5"
+                  value={coherenceThreshold}
+                  onChange={(e) => setCoherenceThreshold(parseInt(e.target.value))}
+                  className="w-full accent-[var(--accent-primary)]"
+                />
+                <div className="flex justify-between text-xs text-[var(--text-muted)] mt-1">
+                  <span>Loose</span>
+                  <span>Strict</span>
+                </div>
+              </div>
+
+              {/* Max per anchor artist */}
+              <div>
+                <label className="block text-sm font-medium text-[var(--text-secondary)] mb-2">
+                  Tracks per anchor artist: {maxPerAnchorArtist}
+                </label>
+                <input
+                  type="range"
+                  min="0"
+                  max="10"
+                  step="1"
+                  value={maxPerAnchorArtist}
+                  onChange={(e) => setMaxPerAnchorArtist(parseInt(e.target.value))}
+                  className="w-full accent-[var(--accent-primary)]"
+                />
+                <div className="flex justify-between text-xs text-[var(--text-muted)] mt-1">
+                  <span>None</span>
+                  <span>Many</span>
+                </div>
+              </div>
+
+              {/* Max per similar artist */}
+              <div>
+                <label className="block text-sm font-medium text-[var(--text-secondary)] mb-2">
+                  Tracks per similar artist: {maxPerSimilarArtist}
+                </label>
+                <input
+                  type="range"
+                  min="1"
+                  max="5"
+                  step="1"
+                  value={maxPerSimilarArtist}
+                  onChange={(e) => setMaxPerSimilarArtist(parseInt(e.target.value))}
+                  className="w-full accent-[var(--accent-primary)]"
+                />
+                <div className="flex justify-between text-xs text-[var(--text-muted)] mt-1">
+                  <span>1</span>
+                  <span>5</span>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Generate Button */}
           <button

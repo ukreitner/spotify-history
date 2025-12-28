@@ -522,6 +522,9 @@ def generate_vibe_playlist(
     discovery_ratio: int = 50,
     flow_mode: FlowMode = "smooth",
     exclude_artists: List[str] = None,
+    coherence_threshold: float = 0.50,
+    max_per_anchor_artist: int = 3,
+    max_per_similar_artist: int = 2,
 ) -> Dict:
     """
     Generate a coherent playlist based on anchor tracks.
@@ -532,6 +535,9 @@ def generate_vibe_playlist(
         discovery_ratio: Percentage of new music (0-100)
         flow_mode: "smooth", "energy_arc", or "shuffle"
         exclude_artists: Artists to exclude
+        coherence_threshold: Minimum coherence score (0-1)
+        max_per_anchor_artist: Max tracks per anchor artist in discovery
+        max_per_similar_artist: Max tracks per similar artist in discovery
 
     Returns:
         Dict with:
@@ -541,6 +547,11 @@ def generate_vibe_playlist(
     """
     exclude_artists = exclude_artists or []
     exclude_lower = {a.lower() for a in exclude_artists}
+
+    # Use provided parameters
+    MIN_COHERENCE_THRESHOLD = coherence_threshold
+    MAX_PER_ANCHOR_ARTIST = max_per_anchor_artist
+    MAX_PER_DISCOVERED_ARTIST = max_per_similar_artist
 
     # Validate anchor tracks
     if not anchor_track_ids or len(anchor_track_ids) > 5:
@@ -683,7 +694,6 @@ def generate_vibe_playlist(
 
         # Strategy 1: Deep cuts from anchor artists (LIMITED - we want NEW artists too)
         anchor_artist_track_count = {}  # Track how many we add per anchor artist
-        MAX_PER_ANCHOR_ARTIST = 3  # Limit discovery from anchor artists
 
         for anchor_artist_id in list(profile.anchor_artist_ids)[:5]:
             # Get albums
@@ -721,7 +731,6 @@ def generate_vibe_playlist(
 
         # Strategy 2: Similar artists via Last.fm (Spotify API is restricted)
         discovered_artist_count = {}  # Limit tracks per discovered artist
-        MAX_PER_DISCOVERED_ARTIST = 2
 
         for anchor_name in list(anchor_artist_names)[:3]:
             # Get similar artists from Last.fm
@@ -792,9 +801,6 @@ def generate_vibe_playlist(
 
     # === STEP 3: Score all candidates for coherence ===
     selected_artists: Dict[str, int] = {}
-
-    # Minimum coherence threshold - filter out unrelated tracks
-    MIN_COHERENCE_THRESHOLD = 0.50
 
     for candidate in candidates:
         score = compute_total_coherence(

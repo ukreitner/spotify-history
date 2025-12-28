@@ -274,6 +274,10 @@ export interface VibePlaylistRequest {
   discovery_ratio?: number;
   flow_mode?: FlowMode;
   exclude_artists?: string[];
+  // Advanced tuning
+  coherence_threshold?: number;  // 0-100
+  max_per_anchor_artist?: number;  // 1-10
+  max_per_similar_artist?: number;  // 1-10
 }
 
 export const generateVibePlaylist = (request: VibePlaylistRequest) =>

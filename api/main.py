@@ -228,6 +228,10 @@ class VibePlaylistRequest(BaseModel):
     discovery_ratio: int = 50
     flow_mode: str = "smooth"  # smooth, energy_arc, shuffle
     exclude_artists: List[str] = []
+    # Advanced tuning parameters
+    coherence_threshold: int = 50  # 0-100, min coherence score (divided by 100)
+    max_per_anchor_artist: int = 3  # tracks per anchor artist in discovery
+    max_per_similar_artist: int = 2  # tracks per similar artist in discovery
 
 
 @app.post("/api/recommendations/vibe")
@@ -254,6 +258,9 @@ def recommendations_vibe(request: VibePlaylistRequest):
             discovery_ratio=request.discovery_ratio,
             flow_mode=request.flow_mode,
             exclude_artists=request.exclude_artists,
+            coherence_threshold=request.coherence_threshold / 100,
+            max_per_anchor_artist=request.max_per_anchor_artist,
+            max_per_similar_artist=request.max_per_similar_artist,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
