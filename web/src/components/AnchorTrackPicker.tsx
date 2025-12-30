@@ -14,6 +14,7 @@ interface AnchorTrackPickerProps {
   onSelect: (track: AnchorTrack) => void;
   onRemove: (trackId: string) => void;
   maxAnchors?: number;
+  compact?: boolean;
 }
 
 type TabType = 'recent' | 'history' | 'spotify';
@@ -23,6 +24,7 @@ export default function AnchorTrackPicker({
   onSelect,
   onRemove,
   maxAnchors = 5,
+  compact = false,
 }: AnchorTrackPickerProps) {
   const [activeTab, setActiveTab] = useState<TabType>('recent');
   const [historyQuery, setHistoryQuery] = useState('');
@@ -63,9 +65,9 @@ export default function AnchorTrackPicker({
   ];
 
   return (
-    <div className="space-y-4">
-      {/* Selected Anchors */}
-      {selectedAnchors.length > 0 && (
+    <div className={compact ? "space-y-2" : "space-y-4"}>
+      {/* Selected Anchors - hide in compact mode */}
+      {!compact && selectedAnchors.length > 0 && (
         <div className="space-y-2">
           <p className="text-sm text-[var(--text-secondary)]">
             Selected anchors ({selectedAnchors.length}/{maxAnchors})
@@ -133,7 +135,7 @@ export default function AnchorTrackPicker({
       </div>
 
       {/* Tab Content */}
-      <div className="min-h-[200px]">
+      <div className={compact ? "min-h-[150px]" : "min-h-[200px]"}>
         {/* Recent Tab */}
         {activeTab === 'recent' && (
           <div className="space-y-2">

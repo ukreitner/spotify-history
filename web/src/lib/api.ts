@@ -291,3 +291,126 @@ export const getRecentTracks = (days = 7, limit = 20) =>
 
 export const searchHistoryTracks = (query: string, limit = 20) =>
   api.get<AnchorTrack[]>('/tracks/history/search', { params: { q: query, limit } }).then(r => r.data);
+
+// === Frog Playlist Types (A* Pathfinding) ===
+
+export interface FrogTrack {
+  track_id: string;
+  track: string;
+  artist: string;
+  album?: string | null;
+  image_url?: string | null;
+  preview_url?: string | null;
+  spotify_url?: string | null;
+  position: number;
+  role: 'start' | 'bridge' | 'end' | string;
+}
+
+export interface FrogPlaylistRequest {
+  start_track_id: string;
+  end_track_id: string;
+  track_count?: number;
+}
+
+export interface FrogPlaylistResult {
+  tracks: FrogTrack[];
+  path_length: number;
+  sampled_length: number;
+  success: boolean;
+  error?: string;
+}
+
+export const generateFrogPlaylist = (request: FrogPlaylistRequest) =>
+  api.post<FrogPlaylistResult>('/recommendations/frog', request).then(r => r.data);
+
+// === Frog Playlist Streaming (SSE) ===
+
+export interface FrogProgressEvent {
+  type: 'progress';
+  phase: 'init' | 'neighborhood' | 'search' | 'resolving';
+  message?: string;
+  iteration?: number;
+  visited?: number;
+  queue_size?: number;
+  best_h?: number;
+  current_track?: string;
+  start_track?: string;
+  end_track?: string;
+  neighborhood_1hop?: number;
+  neighborhood_2hop?: number;
+}
+
+export interface FrogResultEvent {
+  type: 'result';
+  tracks: FrogTrack[];
+  path_length: number;
+  sampled_length: number;
+  success: boolean;
+}
+
+export interface FrogErrorEvent {
+  type: 'error';
+  error: string;
+}
+
+export type FrogStreamEvent = FrogProgressEvent | FrogResultEvent | FrogErrorEvent;
+
+export const generateFrogPlaylistStreaming = (
+  request: FrogPlaylistRequest,
+  onProgress: (event: FrogProgressEvent) => void,
+  onResult: (event: FrogResultEvent) => void,
+  onError: (event: FrogErrorEvent) => void,
+): (() => void) => {
+  const controller = new AbortController();
+
+  fetch('http://127.0.0.1:8000/api/recommendations/frog/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+    signal: controller.signal,
+  })
+    .then(async (response) => {
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('No response body');
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE events from buffer
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            try {
+              const event = JSON.parse(data) as FrogStreamEvent;
+              if (event.type === 'progress') {
+                onProgress(event);
+              } else if (event.type === 'result') {
+                onResult(event);
+              } else if (event.type === 'error') {
+                onError(event);
+              }
+            } catch {
+              // Ignore parse errors
+            }
+          }
+        }
+      }
+    })
+    .catch((err) => {
+      if (err.name !== 'AbortError') {
+        onError({ type: 'error', error: err.message || 'Stream error' });
+      }
+    });
+
+  // Return cancel function
+  return () => controller.abort();
+};

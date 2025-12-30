@@ -1,7 +1,9 @@
 from typing import List, Literal, Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+import json
 
 from .services.analyzer import (
     get_overview, get_overview_split, get_top_artists_stats, get_top_genres_stats,
@@ -264,6 +266,81 @@ def recommendations_vibe(request: VibePlaylistRequest):
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# === FROG PLAYLIST (A* PATHFINDING) ===
+
+class FrogPlaylistRequest(BaseModel):
+    start_track_id: str
+    end_track_id: str
+    track_count: int = 20
+
+
+@app.post("/api/recommendations/frog")
+def recommendations_frog(request: FrogPlaylistRequest):
+    """
+    Generate a playlist that transitions from start track to end track.
+
+    Uses A* pathfinding over Last.fm's track similarity graph to find
+    the smoothest path between two songs.
+    """
+    from .services.frog_playlist import generate_frog_playlist
+
+    if not request.start_track_id or not request.end_track_id:
+        raise HTTPException(status_code=400, detail="Need both start and end tracks")
+
+    if request.start_track_id == request.end_track_id:
+        raise HTTPException(status_code=400, detail="Start and end tracks must be different")
+
+    if request.track_count < 3:
+        raise HTTPException(status_code=400, detail="Track count must be at least 3")
+
+    if request.track_count > 50:
+        raise HTTPException(status_code=400, detail="Track count must be at most 50")
+
+    result = generate_frog_playlist(
+        start_track_id=request.start_track_id,
+        end_track_id=request.end_track_id,
+        track_count=request.track_count,
+    )
+
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to generate playlist"))
+
+    return result
+
+
+@app.post("/api/recommendations/frog/stream")
+def recommendations_frog_stream(request: FrogPlaylistRequest):
+    """
+    Generate a frog playlist with real-time progress updates via SSE.
+
+    Streams progress events during A* search, then final result.
+    """
+    from .services.frog_playlist import generate_frog_playlist_streaming
+
+    if not request.start_track_id or not request.end_track_id:
+        raise HTTPException(status_code=400, detail="Need both start and end tracks")
+
+    if request.start_track_id == request.end_track_id:
+        raise HTTPException(status_code=400, detail="Start and end tracks must be different")
+
+    def event_generator():
+        for event in generate_frog_playlist_streaming(
+            start_track_id=request.start_track_id,
+            end_track_id=request.end_track_id,
+            track_count=request.track_count,
+        ):
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )
 
 
 @app.get("/api/tracks/search")
