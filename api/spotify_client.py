@@ -1,7 +1,8 @@
 from typing import Optional, List, Dict
 import time
 import spotipy
-from spotipy.oauth2 import SpotifyOAuth
+from spotipy.cache_handler import MemoryCacheHandler
+from spotipy.oauth2 import SpotifyOAuth, SpotifyPKCE
 from .config import SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REFRESH_TOKEN
 
 
@@ -18,14 +19,26 @@ def get_spotify_client() -> spotipy.Spotify:
     if _token_cache and _token_cache.get("expires_at", 0) > now + 300:
         return spotipy.Spotify(auth=_token_cache["access_token"])
 
-    # Refresh the token
-    oauth = SpotifyOAuth(
-        client_id=SPOTIFY_CLIENT_ID,
-        client_secret=SPOTIFY_CLIENT_SECRET,
-        redirect_uri="http://127.0.0.1:8888/callback",
-        scope="user-read-recently-played playlist-modify-public playlist-modify-private",
-        cache_path="/tmp/.spotify-cache",
-    )
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_REFRESH_TOKEN:
+        raise RuntimeError(
+            "Spotify is not connected. Run scripts/authorize_local.py to authorize this checkout."
+        )
+
+    auth_kwargs = {
+        "client_id": SPOTIFY_CLIENT_ID,
+        "redirect_uri": "http://127.0.0.1:8888/callback",
+        "scope": "user-read-recently-played playlist-modify-public playlist-modify-private",
+        "cache_handler": MemoryCacheHandler(),
+        "open_browser": False,
+    }
+
+    # Production/Actions can continue using the confidential-client flow,
+    # while a local checkout can use PKCE without copying the app secret.
+    if SPOTIFY_CLIENT_SECRET:
+        oauth = SpotifyOAuth(client_secret=SPOTIFY_CLIENT_SECRET, **auth_kwargs)
+    else:
+        oauth = SpotifyPKCE(**auth_kwargs)
+
     token = oauth.refresh_access_token(SPOTIFY_REFRESH_TOKEN)
     _token_cache = token
     return spotipy.Spotify(auth=token["access_token"])

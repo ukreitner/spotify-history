@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useRef } from 'react';
 import { useMutation } from '@tanstack/react-query';
+import axios from 'axios';
 import {
   AnchorTrack,
   FlowMode,
@@ -167,14 +168,20 @@ export default function PlaylistsPage() {
   };
 
   const flowModes: { value: FlowMode; label: string; desc: string }[] = [
-    { value: 'smooth', label: 'Smooth Flow', desc: 'Minimize jarring transitions' },
-    { value: 'energy_arc', label: 'Energy Arc', desc: 'Build up, peak, wind down' },
+    { value: 'smooth', label: 'Smooth Flow', desc: 'Anchor first, then closest neighbors' },
+    { value: 'energy_arc', label: 'Energy Arc', desc: 'Uses energy data when Spotify provides it' },
     { value: 'shuffle', label: 'Shuffle', desc: 'Random order' },
   ];
 
   const isGenerating = mode === 'vibe' ? generateVibeMutation.isPending : frogLoading;
   const hasError = mode === 'vibe' ? generateVibeMutation.isError : !!frogError;
   const canGenerate = mode === 'vibe' ? anchors.length > 0 : (startTrack && endTrack);
+  const vibeError = generateVibeMutation.error;
+  const vibeErrorMessage = axios.isAxiosError<{ detail?: string }>(vibeError)
+    ? vibeError.response?.data?.detail || vibeError.message
+    : vibeError instanceof Error
+      ? vibeError.message
+      : 'Failed to generate playlist.';
 
   return (
     <div className="space-y-6">
@@ -648,7 +655,7 @@ export default function PlaylistsPage() {
 
           {hasError && (
             <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
-              {mode === 'frog' ? (frogError || 'No path found. Try tracks that are more similar.') : 'Failed to generate playlist. Try again.'}
+              {mode === 'frog' ? (frogError || 'No path found. Try tracks that are more similar.') : vibeErrorMessage}
             </div>
           )}
         </div>
@@ -709,9 +716,11 @@ export default function PlaylistsPage() {
                 <div className="flex gap-4 text-xs text-[var(--text-muted)]">
                   <span>History: {vibeResult.counts.history}</span>
                   <span>Discovery: {vibeResult.counts.discovery}</span>
-                  {vibeResult.flow_stats.smooth_transitions > 0 && (
-                    <span>Smooth transitions: {vibeResult.flow_stats.smooth_transitions}</span>
-                  )}
+                  <span>
+                    {vibeResult.flow_stats.ordering_basis === 'artist_similarity'
+                      ? 'Flow: artist similarity'
+                      : `Smooth transitions: ${vibeResult.flow_stats.smooth_transitions}`}
+                  </span>
                 </div>
               </div>
 
@@ -729,13 +738,15 @@ export default function PlaylistsPage() {
                       subtitle={
                         track.source === 'discovery'
                           ? `New · ${track.discovered_via || 'discovery'}`
-                          : `${track.play_count} plays`
+                          : track.discovered_via === 'anchor'
+                            ? `Anchor · ${track.play_count} plays`
+                            : `${track.play_count} plays`
                       }
                       index={i}
                       energy={track.energy}
                       valence={track.valence}
                       tempo={track.tempo}
-                      showFeatures={true}
+                      showFeatures={vibeResult.vibe_profile.has_audio_features}
                     />
                   ))}
                 </div>

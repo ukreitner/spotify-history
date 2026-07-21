@@ -1,6 +1,11 @@
-from typing import List, Dict, Set, Optional, Literal
+from typing import List, Dict, Set, Optional, Literal, Tuple
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 import random
+import math
+import re
+import unicodedata
 from ..db import (
     get_all_tracks_with_counts, get_top_artists, get_top_genres, query_all_dbs,
     get_top_tracks, get_recent_listening, search_user_tracks
@@ -8,11 +13,12 @@ from ..db import (
 from ..spotify_client import (
     enrich_tracks_with_spotify_data, search_tracks_by_genre, get_audio_features,
     get_recommendations, get_artist_related, get_artist_top_tracks, search_artist,
-    get_artist_albums, get_album_tracks, get_tracks_bulk, get_artists_bulk
+    get_artist_albums, get_album_tracks, get_tracks_bulk, get_artists_bulk,
+    search_tracks_advanced,
 )
-from ..lastfm_client import get_similar_artists
+from ..lastfm_client import get_similar_artists, get_similar_tracks_batch
 from .vibe_profile import build_vibe_profile, VibeProfile, get_top_genres as vibe_top_genres
-from .coherence import compute_total_coherence, get_coherence_breakdown
+from .coherence import compute_total_coherence, get_coherence_breakdown, score_popularity_balance
 from .flow_ordering import order_playlist, FlowMode
 
 
@@ -516,7 +522,84 @@ def generate_custom_playlist(
     return result[:limit]
 
 
-def generate_vibe_playlist(
+def _normalize_music_text(value: str) -> str:
+    """Normalize artist/title metadata for cross-catalog exact matching."""
+    text = unicodedata.normalize("NFKD", value or "").encode("ascii", "ignore").decode()
+    text = text.lower().replace("&", " and ")
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _primary_artist_name(value: str) -> str:
+    """Return the first credited artist from the archive's display string."""
+    return (value or "").split(",", 1)[0].strip()
+
+
+def _track_key(artist: str, title: str) -> Tuple[str, str]:
+    return (_normalize_music_text(artist), _normalize_music_text(title))
+
+
+def _spotify_track_matches(track: Dict, artist: str, title: str) -> bool:
+    """Require the requested artist and title instead of trusting search rank."""
+    artist_key, title_key = _track_key(artist, title)
+    spotify_artists = {
+        _normalize_music_text(item.get("name", ""))
+        for item in track.get("artists", [])
+    }
+    spotify_title = _normalize_music_text(track.get("name", ""))
+    if artist_key not in spotify_artists:
+        return False
+    if spotify_title == title_key:
+        return True
+
+    # Catalog titles often add a remaster/live suffix. Only accept a prefix
+    # relation when the meaningful title is long enough to avoid loose matches.
+    return len(title_key) >= 8 and (
+        spotify_title.startswith(title_key) or title_key.startswith(spotify_title)
+    )
+
+
+@lru_cache(maxsize=1000)
+def _resolve_spotify_track(artist: str, title: str) -> Optional[Dict]:
+    """Resolve one Last.fm artist/title pair to the matching Spotify track."""
+    safe_artist = (artist or "").replace('"', " ").strip()
+    safe_title = (title or "").replace('"', " ").strip()
+    if not safe_artist or not safe_title:
+        return None
+    results = search_tracks_advanced(
+        f'track:"{safe_title}" artist:"{safe_artist}"',
+        limit=8,
+        market="CH",
+    )
+    exact = [
+        track for track in results
+        if track and _spotify_track_matches(track, safe_artist, safe_title)
+    ]
+    if not exact:
+        return None
+    exact.sort(
+        key=lambda track: (
+            _normalize_music_text(track.get("name", ""))
+            != _normalize_music_text(safe_title),
+            -int(track.get("popularity", 0) or 0),
+        )
+    )
+    return exact[0]
+
+
+def _artist_names(track: Dict) -> List[str]:
+    return [
+        artist.get("name", "").strip()
+        for artist in track.get("artists", [])
+        if artist.get("name")
+    ]
+
+
+def _candidate_artist_key(candidate: Dict) -> str:
+    names = _artist_names(candidate.get("track", {}))
+    return _normalize_music_text(names[0] if names else "")
+
+
+def _generate_vibe_playlist_legacy(
     anchor_track_ids: List[str],
     track_count: int = 30,
     discovery_ratio: int = 50,
@@ -908,6 +991,437 @@ def generate_vibe_playlist(
             "target_energy": profile.target_energy,
             "target_valence": profile.target_valence,
             "target_tempo": profile.target_tempo,
+        },
+        "flow_stats": flow_stats,
+        "counts": {
+            "history": history_selected,
+            "discovery": discovery_selected,
+            "total": len(result_tracks),
+        },
+    }
+
+
+def generate_vibe_playlist(
+    anchor_track_ids: List[str],
+    track_count: int = 30,
+    discovery_ratio: int = 50,
+    flow_mode: FlowMode = "smooth",
+    exclude_artists: List[str] = None,
+    coherence_threshold: float = 0.50,
+    max_per_anchor_artist: int = 3,
+    max_per_similar_artist: int = 2,
+) -> Dict:
+    """Generate a playlist backed by exact Last.fm similarity evidence.
+
+    Spotify no longer exposes recommendations, related artists, or audio
+    features to many development-mode apps. The former fallback treated broad
+    genre substrings as evidence (for example, ``pop`` matching ``baroque
+    pop``), which admitted unrelated tracks. This implementation uses exact
+    artist/title matches from Last.fm's similarity graph and validates every
+    result against Spotify before returning it.
+    """
+    exclude_keys = {_normalize_music_text(name) for name in (exclude_artists or [])}
+    if not anchor_track_ids or len(anchor_track_ids) > 5:
+        raise ValueError("Need 1-5 anchor tracks")
+
+    anchor_tracks = get_tracks_bulk(anchor_track_ids)
+    anchor_map = {track.get("id"): track for track in anchor_tracks if track}
+    anchor_tracks = [anchor_map[track_id] for track_id in anchor_track_ids if track_id in anchor_map]
+    if not anchor_tracks:
+        raise ValueError("Could not fetch anchor tracks")
+
+    anchor_pairs: List[Tuple[str, str]] = []
+    anchor_artist_keys: Set[str] = set()
+    for track in anchor_tracks:
+        title = track.get("name", "")
+        for artist in _artist_names(track)[:1]:
+            anchor_pairs.append((artist, title))
+            anchor_artist_keys.add(_normalize_music_text(artist))
+
+    # Build the artist neighborhood. Rank is used alongside Last.fm's match
+    # value because match magnitudes vary dramatically between artists.
+    artist_evidence: Dict[str, Dict] = {}
+    for anchor_name, _ in anchor_pairs:
+        similar = get_similar_artists(anchor_name, limit=40)
+        total = max(len(similar) - 1, 1)
+        for rank, item in enumerate(similar):
+            name = item.get("name", "").strip()
+            key = _normalize_music_text(name)
+            if not key or key in exclude_keys:
+                continue
+            rank_score = 1 - rank / total
+            raw_match = min(1.0, float(item.get("match", 0) or 0))
+            relation = min(0.98, 0.68 + 0.20 * rank_score + 0.10 * raw_match)
+            current = artist_evidence.get(key)
+            if current is None or relation > current["score"]:
+                artist_evidence[key] = {
+                    "name": name,
+                    "score": relation,
+                    "anchor": anchor_name,
+                    "rank": rank,
+                }
+
+    for anchor_name, _ in anchor_pairs:
+        artist_evidence[_normalize_music_text(anchor_name)] = {
+            "name": anchor_name,
+            "score": 1.0,
+            "anchor": anchor_name,
+            "rank": -1,
+        }
+
+    similar_tracks_by_anchor = get_similar_tracks_batch(
+        anchor_pairs,
+        limit=60,
+        max_workers=min(5, len(anchor_pairs)),
+    )
+    track_evidence: Dict[Tuple[str, str], Dict] = {}
+    for pair, similar_tracks in similar_tracks_by_anchor.items():
+        anchor_name, _ = pair
+        total = max(len(similar_tracks) - 1, 1)
+        for rank, item in enumerate(similar_tracks):
+            artist = item.get("artist", "").strip()
+            title = item.get("name", "").strip()
+            key = _track_key(artist, title)
+            if not all(key) or key[0] in exclude_keys:
+                continue
+            rank_score = 1 - rank / total
+            relation = min(0.99, 0.72 + 0.25 * rank_score)
+            current = track_evidence.get(key)
+            if current is None or relation > current["score"]:
+                track_evidence[key] = {
+                    "artist": artist,
+                    "title": title,
+                    "score": relation,
+                    "anchor": anchor_name,
+                    "rank": rank,
+                }
+
+    all_history = get_all_tracks_with_counts("music")
+    known_track_ids = set(all_history)
+    known_track_keys = {
+        _track_key(_primary_artist_name(row.get("artist", "")), row.get("track", ""))
+        for row in all_history.values()
+    }
+    desired_discovery = int(track_count * discovery_ratio / 100)
+    desired_history = track_count - desired_discovery
+
+    # Fetch anchor genres for the UI's vibe summary. Similarity-neighborhood
+    # tags are kept separately and only used as a flow fallback.
+    anchor_artist_ids = {
+        artist.get("id")
+        for track in anchor_tracks
+        for artist in track.get("artists", [])
+        if artist.get("id")
+    }
+    anchor_artists = get_artists_bulk(list(anchor_artist_ids))
+    anchor_genres: List[str] = []
+    for artist in anchor_artists:
+        for genre in artist.get("genres", []):
+            if genre not in anchor_genres:
+                anchor_genres.append(genre)
+
+    candidates: List[Dict] = []
+    seen_candidate_ids: Set[str] = set()
+    seen_candidate_keys: Set[Tuple[str, str]] = set()
+
+    def add_candidate(
+        track: Dict,
+        source: str,
+        relation: float,
+        anchor_name: str,
+        via: Optional[str],
+        play_count: int = 0,
+        is_anchor: bool = False,
+    ) -> bool:
+        track_id = track.get("id")
+        if not track_id or track_id in seen_candidate_ids:
+            return False
+        names = _artist_names(track)
+        artist_keys = {_normalize_music_text(name) for name in names}
+        if artist_keys & exclude_keys:
+            return False
+        semantic_key = _track_key(names[0] if names else "", track.get("name", ""))
+        if semantic_key in seen_candidate_keys:
+            return False
+
+        popularity_score = score_popularity_balance(track.get("popularity"))
+        familiarity = min(1.0, math.log1p(max(play_count, 0)) / math.log(12))
+        coherence = min(
+            1.0,
+            0.58 + 0.32 * relation + 0.06 * familiarity + 0.04 * popularity_score,
+        )
+        candidates.append({
+            "track": track,
+            "features": {},
+            "genres": {f"similarity:{_normalize_music_text(anchor_name)}"},
+            "source": source,
+            "via": via,
+            "play_count": play_count,
+            "coherence_score": coherence,
+            "relation_score": relation,
+            "is_anchor": is_anchor,
+        })
+        seen_candidate_ids.add(track_id)
+        seen_candidate_keys.add(semantic_key)
+        return True
+
+    # Anchors are included exactly once: a seed should visibly ground the mix.
+    for track in anchor_tracks:
+        anchor_name = _artist_names(track)[0] if _artist_names(track) else "anchor"
+        history_row = all_history.get(track.get("id"), {})
+        add_candidate(
+            track,
+            source="history",
+            relation=1.0,
+            anchor_name=anchor_name,
+            via="anchor",
+            play_count=int(history_row.get("play_count", 0) or 0),
+            is_anchor=True,
+        )
+
+    # Familiar candidates must be by the anchor or an explicitly similar
+    # artist, or be an exact track-level Last.fm match. Filter the 11k-track
+    # archive before making any Spotify requests so selection is not biased by
+    # arbitrary database insertion order.
+    history_ranked: List[Tuple[float, int, str, Dict]] = []
+    for track_id, row in all_history.items():
+        if not track_id or track_id in seen_candidate_ids:
+            continue
+        artist_name = _primary_artist_name(row.get("artist", ""))
+        artist_key = _normalize_music_text(artist_name)
+        if not artist_key or artist_key in exclude_keys:
+            continue
+        evidence = artist_evidence.get(artist_key)
+        track_match = track_evidence.get(_track_key(artist_name, row.get("track", "")))
+        if not evidence and not track_match:
+            continue
+        relation = max(
+            evidence["score"] if evidence else 0,
+            track_match["score"] if track_match else 0,
+        )
+        anchor_name = (
+            track_match["anchor"] if track_match
+            else evidence["anchor"] if evidence
+            else anchor_pairs[0][0]
+        )
+        history_ranked.append((
+            relation,
+            int(row.get("play_count", 0) or 0),
+            anchor_name,
+            row,
+        ))
+
+    history_ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    history_lookup = {item[3]["track_id"]: item for item in history_ranked}
+    history_fetch_ids = [
+        item[3]["track_id"]
+        for item in history_ranked[: max(100, desired_history * 10)]
+    ]
+    for track in get_tracks_bulk(history_fetch_ids):
+        item = history_lookup.get(track.get("id"))
+        if not item:
+            continue
+        relation, play_count, anchor_name, _ = item
+        add_candidate(
+            track,
+            source="history",
+            relation=relation,
+            anchor_name=anchor_name,
+            via=f"familiar · similar to {anchor_name}",
+            play_count=play_count,
+        )
+
+    # Prefer exact similar tracks for discovery. Resolve a bounded set in
+    # parallel, then validate artist and title to reject search impostors.
+    ranked_track_evidence = sorted(
+        track_evidence.values(),
+        key=lambda item: (item["score"], -item["rank"]),
+        reverse=True,
+    )
+    resolve_limit = max(24, min(60, desired_discovery * 3))
+    exact_results: List[Tuple[Dict, Optional[Dict]]] = []
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        future_map = {
+            executor.submit(_resolve_spotify_track, item["artist"], item["title"]): item
+            for item in ranked_track_evidence[:resolve_limit]
+        }
+        for future in as_completed(future_map):
+            item = future_map[future]
+            try:
+                exact_results.append((item, future.result()))
+            except Exception:
+                continue
+
+    exact_results.sort(key=lambda pair: (pair[0]["score"], -pair[0]["rank"]), reverse=True)
+    for evidence, track in exact_results:
+        if not track or track.get("id") in known_track_ids:
+            continue
+        names = _artist_names(track)
+        if _track_key(names[0] if names else "", track.get("name", "")) in known_track_keys:
+            continue
+        add_candidate(
+            track,
+            source="discovery",
+            relation=evidence["score"],
+            anchor_name=evidence["anchor"],
+            via=f"track match · {evidence['anchor']}",
+        )
+
+    # Fill any remaining discovery pool from top tracks by validated similar
+    # artists. Artist-name equality is mandatory; a top search result alone is
+    # not evidence that Spotify resolved the intended artist.
+    discovery_pool_size = sum(1 for candidate in candidates if candidate["source"] == "discovery")
+    discovery_pool_target = max(desired_discovery + 8, math.ceil(desired_discovery * 1.5))
+    if discovery_pool_size < discovery_pool_target:
+        for artist_key, evidence in sorted(
+            artist_evidence.items(),
+            key=lambda item: item[1]["score"],
+            reverse=True,
+        ):
+            if artist_key in anchor_artist_keys or artist_key in exclude_keys:
+                continue
+            spotify_artist = search_artist(evidence["name"])
+            if not spotify_artist:
+                continue
+            if _normalize_music_text(spotify_artist.get("name", "")) != artist_key:
+                continue
+            for track in get_artist_top_tracks(spotify_artist.get("id"), market="CH")[:3]:
+                if track.get("id") in known_track_ids:
+                    continue
+                names = _artist_names(track)
+                if _track_key(names[0] if names else "", track.get("name", "")) in known_track_keys:
+                    continue
+                add_candidate(
+                    track,
+                    source="discovery",
+                    relation=evidence["score"],
+                    anchor_name=evidence["anchor"],
+                    via=f"similar artist · {evidence['anchor']}",
+                )
+            discovery_pool_size = sum(
+                1 for candidate in candidates if candidate["source"] == "discovery"
+            )
+            if discovery_pool_size >= discovery_pool_target:
+                break
+
+    candidates = [
+        candidate for candidate in candidates
+        if candidate["coherence_score"] >= coherence_threshold
+    ]
+    anchors = [candidate for candidate in candidates if candidate["is_anchor"]]
+    history_candidates = sorted(
+        [candidate for candidate in candidates if candidate["source"] == "history" and not candidate["is_anchor"]],
+        key=lambda candidate: (candidate["coherence_score"], candidate["play_count"]),
+        reverse=True,
+    )
+    discovery_candidates = sorted(
+        [candidate for candidate in candidates if candidate["source"] == "discovery"],
+        key=lambda candidate: candidate["coherence_score"],
+        reverse=True,
+    )
+
+    selected: List[Dict] = []
+    selected_ids: Set[str] = set()
+    artist_counts: Dict[str, int] = {}
+
+    def select(candidate: Dict) -> bool:
+        track = candidate["track"]
+        track_id = track.get("id")
+        artist_key = _candidate_artist_key(candidate)
+        if not track_id or track_id in selected_ids or not artist_key:
+            return False
+        limit = max_per_anchor_artist if artist_key in anchor_artist_keys else max_per_similar_artist
+        if artist_counts.get(artist_key, 0) >= limit:
+            return False
+        selected.append(candidate)
+        selected_ids.add(track_id)
+        artist_counts[artist_key] = artist_counts.get(artist_key, 0) + 1
+        return True
+
+    for candidate in anchors:
+        select(candidate)
+
+    for candidate in history_candidates:
+        if sum(item["source"] == "history" for item in selected) >= desired_history:
+            break
+        select(candidate)
+    for candidate in discovery_candidates:
+        if sum(item["source"] == "discovery" for item in selected) >= desired_discovery:
+            break
+        select(candidate)
+
+    # If one side of the requested ratio has too few strong candidates, fill
+    # with the other side rather than silently returning a short playlist.
+    leftovers = sorted(
+        [*history_candidates, *discovery_candidates],
+        key=lambda candidate: candidate["coherence_score"],
+        reverse=True,
+    )
+    for candidate in leftovers:
+        if len(selected) >= track_count:
+            break
+        select(candidate)
+
+    # Enrich candidate genres for transition ordering. Similarity-neighborhood
+    # tags remain as a dependable fallback when Spotify audio features are not
+    # available to the application.
+    selected_artist_ids = {
+        artist.get("id")
+        for candidate in selected
+        for artist in candidate["track"].get("artists", [])
+        if artist.get("id")
+    }
+    genre_by_artist = {
+        artist.get("id"): set(artist.get("genres", []))
+        for artist in get_artists_bulk(list(selected_artist_ids))
+        if artist
+    }
+    for candidate in selected:
+        for artist in candidate["track"].get("artists", []):
+            candidate["genres"].update(genre_by_artist.get(artist.get("id"), set()))
+
+    selected_tracks = [candidate["track"] for candidate in selected]
+    features_map = {candidate["track"]["id"]: candidate["features"] for candidate in selected}
+    genres_map = {candidate["track"]["id"]: candidate["genres"] for candidate in selected}
+    ordered_tracks = order_playlist(selected_tracks, features_map, genres_map, flow_mode)
+    candidate_map = {candidate["track"]["id"]: candidate for candidate in selected}
+
+    result_tracks = []
+    for track in ordered_tracks:
+        candidate = candidate_map[track["id"]]
+        album = track.get("album", {})
+        images = album.get("images", [])
+        result_tracks.append({
+            "track_id": track.get("id"),
+            "track": track.get("name"),
+            "artist": ", ".join(_artist_names(track)),
+            "image_url": images[0]["url"] if images else None,
+            "preview_url": track.get("preview_url"),
+            "spotify_url": track.get("external_urls", {}).get("spotify"),
+            "source": candidate["source"],
+            "discovered_via": candidate.get("via"),
+            "coherence_score": round(candidate["coherence_score"], 3),
+            "energy": None,
+            "valence": None,
+            "tempo": None,
+            "play_count": candidate.get("play_count", 0),
+        })
+
+    from .flow_ordering import compute_playlist_flow_stats
+    flow_stats = compute_playlist_flow_stats(ordered_tracks, features_map, genres_map)
+    flow_stats["ordering_basis"] = "audio_features" if any(features_map.values()) else "artist_similarity"
+
+    history_selected = sum(track["source"] == "history" for track in result_tracks)
+    discovery_selected = sum(track["source"] == "discovery" for track in result_tracks)
+    return {
+        "tracks": result_tracks,
+        "vibe_profile": {
+            "anchor_count": len(anchor_tracks),
+            "has_audio_features": any(features_map.values()),
+            "top_genres": anchor_genres[:5],
+            "target_energy": None,
+            "target_valence": None,
+            "target_tempo": None,
         },
         "flow_stats": flow_stats,
         "counts": {

@@ -10,7 +10,7 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .config import LASTFM_API_KEY
 
-LASTFM_API_BASE = "http://ws.audioscrobbler.com/2.0/"
+LASTFM_API_BASE = "https://ws.audioscrobbler.com/2.0/"
 
 
 @lru_cache(maxsize=2000)

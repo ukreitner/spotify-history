@@ -7,22 +7,22 @@ import { getPodcastStats, getTopShows, getRecentEpisodes, getPodcastBacklog, get
 export default function PodcastsPage() {
   const [selectedShow, setSelectedShow] = useState<string | null>(null);
 
-  const { data: stats } = useQuery({
+  const { data: stats, isLoading: statsLoading, error: statsError, refetch: refetchStats } = useQuery({
     queryKey: ['podcastStats'],
     queryFn: () => getPodcastStats(),
   });
 
-  const { data: shows } = useQuery({
+  const { data: shows, isLoading: showsLoading, error: showsError, refetch: refetchShows } = useQuery({
     queryKey: ['topShows'],
     queryFn: () => getTopShows(10),
   });
 
-  const { data: recent } = useQuery({
+  const { data: recent, isLoading: recentLoading, error: recentError, refetch: refetchRecent } = useQuery({
     queryKey: ['recentEpisodes'],
     queryFn: () => getRecentEpisodes(10),
   });
 
-  const { data: backlog } = useQuery({
+  const { data: backlog, isLoading: backlogLoading, error: backlogError, refetch: refetchBacklog } = useQuery({
     queryKey: ['podcastBacklog'],
     queryFn: () => getPodcastBacklog(10),
   });
@@ -32,6 +32,36 @@ export default function PodcastsPage() {
     queryFn: () => getShowEpisodes(selectedShow!, 20),
     enabled: !!selectedShow,
   });
+
+  const isLoading = statsLoading || showsLoading || recentLoading || backlogLoading;
+  const pageError = statsError || showsError || recentError || backlogError;
+
+  if (isLoading) {
+    return (
+      <div className="space-y-4" aria-live="polite">
+        <h1 className="text-4xl font-bold"><span className="gradient-text">Podcast</span> Stats</h1>
+        <p className="text-[var(--text-secondary)]">Reading podcast plays from your archive...</p>
+      </div>
+    );
+  }
+
+  if (pageError) {
+    return (
+      <section className="archive-error" role="alert">
+        <div className="archive-error-mark">!</div>
+        <p className="eyebrow">Podcasts unavailable</p>
+        <h1>The podcast archive could not be loaded.</h1>
+        <p>Your music archive is unaffected. Retry the podcast queries when the local API is ready.</p>
+        <button
+          type="button"
+          className="btn-primary"
+          onClick={() => void Promise.all([refetchStats(), refetchShows(), refetchRecent(), refetchBacklog()])}
+        >
+          Retry
+        </button>
+      </section>
+    );
+  }
 
   return (
     <div className="space-y-8">
@@ -50,21 +80,21 @@ export default function PodcastsPage() {
         <div className="stat-card animate-fade-in opacity-0" style={{ animationDelay: '0.1s' }}>
           <p className="text-[var(--text-muted)] text-sm font-medium uppercase tracking-wider">Total Plays</p>
           <p className="text-4xl font-bold mt-2 text-[var(--accent-pink)]">
-            {stats?.total_plays.toLocaleString() || '—'}
+            {stats ? stats.total_plays.toLocaleString() : '—'}
           </p>
         </div>
         
         <div className="stat-card animate-fade-in opacity-0" style={{ animationDelay: '0.15s' }}>
           <p className="text-[var(--text-muted)] text-sm font-medium uppercase tracking-wider">Shows</p>
           <p className="text-4xl font-bold mt-2 text-[var(--accent-secondary)]">
-            {stats?.unique_shows.toLocaleString() || '—'}
+            {stats ? stats.unique_shows.toLocaleString() : '—'}
           </p>
         </div>
         
         <div className="stat-card animate-fade-in opacity-0" style={{ animationDelay: '0.2s' }}>
           <p className="text-[var(--text-muted)] text-sm font-medium uppercase tracking-wider">Episodes</p>
           <p className="text-4xl font-bold mt-2 text-[var(--accent-tertiary)]">
-            {stats?.unique_episodes.toLocaleString() || '—'}
+            {stats ? stats.unique_episodes.toLocaleString() : '—'}
           </p>
         </div>
       </div>
@@ -95,6 +125,11 @@ export default function PodcastsPage() {
                 </div>
               </button>
             ))}
+            {shows?.length === 0 && (
+              <p className="text-sm text-[var(--text-muted)] py-6 text-center">
+                No podcast plays are present in the imported archive yet.
+              </p>
+            )}
           </div>
         </div>
 
@@ -138,6 +173,11 @@ export default function PodcastsPage() {
                   <p className="text-sm text-[var(--accent-secondary)]">{ep.show}</p>
                 </div>
               ))
+            )}
+            {!selectedShow && recent?.length === 0 && (
+              <p className="text-sm text-[var(--text-muted)] py-6 text-center">
+                Recent podcast episodes will appear here after they are collected.
+              </p>
             )}
           </div>
         </div>

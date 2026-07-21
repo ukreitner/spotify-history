@@ -257,6 +257,7 @@ export interface FlowStats {
   smooth_transitions: number;
   jarring_transitions: number;
   total_transitions: number;
+  ordering_basis?: 'audio_features' | 'artist_similarity';
 }
 
 export interface VibePlaylistResult {

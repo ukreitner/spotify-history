@@ -85,7 +85,9 @@ def order_for_smooth_flow(
     """
     Order tracks for smooth flow using greedy nearest-neighbor.
 
-    Starts with random track, then picks lowest transition cost.
+    Starts with the strongest/anchor track supplied by the selector, then picks
+    the lowest transition cost. Deterministic ordering makes the same anchors
+    reproducible and keeps a selected anchor visibly in the lead position.
     """
     if len(tracks) <= 1:
         return tracks
@@ -93,9 +95,7 @@ def order_for_smooth_flow(
     remaining = list(tracks)
     ordered = []
 
-    # Start with random track
-    start_idx = random.randint(0, len(remaining) - 1)
-    ordered.append(remaining.pop(start_idx))
+    ordered.append(remaining.pop(0))
 
     while remaining:
         last_track = ordered[-1]
@@ -202,10 +202,11 @@ def order_playlist(
         random.shuffle(shuffled)
         return shuffled
 
-    if flow_mode == "energy_arc":
+    if flow_mode == "energy_arc" and any(features_map.values()):
         return order_for_energy_arc(tracks, features_map)
 
-    # Default: smooth flow
+    # Smooth flow is also the honest fallback for an energy arc when Spotify
+    # does not expose audio features to this application.
     return order_for_smooth_flow(tracks, features_map, genres_map)
 
 
@@ -245,7 +246,7 @@ def compute_playlist_flow_stats(
     max_cost = max(transition_costs) if transition_costs else 0
 
     # Count smooth (<0.3) vs jarring (>0.6) transitions
-    smooth = sum(1 for c in transition_costs if c < 0.3)
+    smooth = sum(1 for c in transition_costs if c <= 0.3)
     jarring = sum(1 for c in transition_costs if c > 0.6)
 
     return {

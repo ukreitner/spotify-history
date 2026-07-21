@@ -68,7 +68,7 @@ export default function DiscoverPage() {
         <div>
           <p className="font-medium">Personalized for you</p>
           <p className="text-sm text-[var(--text-muted)]">
-            Based on genres from your top favorites. Click play to preview!
+            Ranked by artist similarity across your recent listens and longtime favorites.
           </p>
         </div>
       </div>
