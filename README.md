@@ -1,5 +1,24 @@
 # spotify-history-codex
 
+## Open the Listening Archive on macOS
+
+Install the one-click launcher once:
+
+```bash
+scripts/install_macos_launcher.sh
+```
+
+Then open **Listening Archive** from `~/Applications` or Spotlight. The launcher:
+
+- reuses the local API and web app when they are already running;
+- otherwise pulls the newest archived history when the checkout is clean;
+- prepares missing dependencies and the production build;
+- starts both local services; and
+- opens `http://127.0.0.1:3000` in Google Chrome.
+
+Startup logs live in the gitignored `.run/` directory. The app continues to use
+the gitignored local `.env` for Spotify authorization.
+
 plan:
 
 # Spotify History Archiver – GitHub‑only Implementation Plan
@@ -267,4 +286,3 @@ Each record's timestamp (`endTime` in older exports or `ts` in newer ones) is
 interpreted as UTC and stored as `played_at` in `data/history_YYYYMM.db`.
 Existing rows are skipped with `INSERT OR IGNORE`.
 If provided, the track's genre is saved in the `genre` column.
-
