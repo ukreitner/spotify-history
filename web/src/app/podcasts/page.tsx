@@ -148,7 +148,7 @@ export default function PodcastsPage() {
         <div className="glass-card p-6 animate-fade-in opacity-0" style={{ animationDelay: '0.35s' }}>
           <h2 className="text-xl font-semibold mb-2">Backlog</h2>
           <p className="text-sm text-[var(--text-muted)] mb-4">
-            Episodes you started but haven't returned to
+            Episodes you started but haven&apos;t returned to
           </p>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             {backlog.map((ep, i) => (

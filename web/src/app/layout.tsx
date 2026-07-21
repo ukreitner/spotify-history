@@ -4,8 +4,8 @@ import Providers from "@/components/Providers";
 import Navigation from "@/components/Navigation";
 
 export const metadata: Metadata = {
-  title: "Spotify History",
-  description: "Analyze your listening history and get personalized recommendations",
+  title: "Listening Archive",
+  description: "A living, searchable picture of your Spotify listening history.",
 };
 
 export default function RootLayout({
@@ -18,7 +18,7 @@ export default function RootLayout({
       <body className="antialiased min-h-screen">
         <Providers>
           <Navigation />
-          <main className="max-w-7xl mx-auto px-6 py-8">
+          <main className="app-main">
             {children}
           </main>
         </Providers>

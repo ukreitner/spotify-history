@@ -1,7 +1,11 @@
 import axios from 'axios';
 
+export const API_BASE_URL =
+  process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, '') || '/api';
+
 const api = axios.create({
-  baseURL: 'http://127.0.0.1:8000/api',
+  baseURL: API_BASE_URL,
+  timeout: 20_000,
 });
 
 export type ContentType = 'all' | 'music' | 'podcast';
@@ -10,6 +14,14 @@ export interface OverviewStats {
   total_plays: number;
   unique_artists: number;
   unique_tracks: number;
+}
+
+export interface ArchiveStatus {
+  database_count: number;
+  first_played_at: string | null;
+  latest_played_at: string | null;
+  latest_database: string | null;
+  latest_database_updated_at: string | null;
 }
 
 export interface SplitStats {
@@ -157,6 +169,9 @@ export const getOverview = (contentType: ContentType = 'all') =>
 
 export const getOverviewSplit = () =>
   api.get<SplitStats>('/stats/overview/split').then(r => r.data);
+
+export const getArchiveStatus = () =>
+  api.get<ArchiveStatus>('/meta/status').then(r => r.data);
 
 export const getTopArtists = (limit = 20, contentType: ContentType = 'all') =>
   api.get<ArtistStat[]>('/stats/artists', { params: { limit, content_type: contentType } }).then(r => r.data);
@@ -363,7 +378,7 @@ export const generateFrogPlaylistStreaming = (
 ): (() => void) => {
   const controller = new AbortController();
 
-  fetch('http://127.0.0.1:8000/api/recommendations/frog/stream', {
+  fetch(`${API_BASE_URL}/recommendations/frog/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request),

@@ -2,6 +2,7 @@ import sqlite3
 from pathlib import Path
 from typing import Iterator, List, Dict, Set, Optional, Literal
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from .config import DATA_DIR
 
 # Content type enum
@@ -85,6 +86,45 @@ def get_content_filter_sql(content_type: ContentType, artist_col: str = "artist"
 def get_all_db_paths() -> List[Path]:
     """Get all monthly database files sorted by date."""
     return sorted(DATA_DIR.glob("history_*.db"))
+
+
+def get_archive_status() -> Dict:
+    """Return lightweight provenance and freshness information for the archive."""
+    db_paths = get_all_db_paths()
+    first_played_at: Optional[str] = None
+    latest_played_at: Optional[str] = None
+
+    for db_path in db_paths:
+        with connect(db_path) as conn:
+            try:
+                row = conn.execute(
+                    "SELECT MIN(played_at) AS first_played_at, "
+                    "MAX(played_at) AS latest_played_at FROM plays"
+                ).fetchone()
+            except sqlite3.OperationalError:
+                continue
+
+        if not row:
+            continue
+        first_value = row["first_played_at"]
+        latest_value = row["latest_played_at"]
+        if first_value and (first_played_at is None or first_value < first_played_at):
+            first_played_at = first_value
+        if latest_value and (latest_played_at is None or latest_value > latest_played_at):
+            latest_played_at = latest_value
+
+    latest_db = max(db_paths, key=lambda path: path.stat().st_mtime, default=None)
+    return {
+        "database_count": len(db_paths),
+        "first_played_at": first_played_at,
+        "latest_played_at": latest_played_at,
+        "latest_database": latest_db.name if latest_db else None,
+        "latest_database_updated_at": (
+            datetime.fromtimestamp(latest_db.stat().st_mtime, tz=timezone.utc).isoformat()
+            if latest_db
+            else None
+        ),
+    }
 
 
 @contextmanager

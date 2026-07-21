@@ -1,324 +1,424 @@
 'use client';
 
-import { useQuery } from '@tanstack/react-query';
-import { getOverview, getTopArtists, getTopGenres, getListeningPatterns, getListeningStreaks, getTopTracks } from '@/lib/api';
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, AreaChart, Area } from 'recharts';
+import { useState } from 'react';
 import Link from 'next/link';
+import { useQuery } from '@tanstack/react-query';
+import {
+  Area,
+  AreaChart,
+  Bar,
+  BarChart,
+  CartesianGrid,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
+import {
+  ContentType,
+  getArchiveStatus,
+  getListeningPatterns,
+  getListeningStreaks,
+  getOverview,
+  getTopArtists,
+  getTopGenres,
+  getTopTracks,
+} from '@/lib/api';
 
-const COLORS = ['#7c3aed', '#8b5cf6', '#a78bfa', '#c4b5fd', '#ddd6fe'];
+const CONTENT_OPTIONS: { value: ContentType; label: string }[] = [
+  { value: 'music', label: 'Music' },
+  { value: 'podcast', label: 'Podcasts' },
+  { value: 'all', label: 'Everything' },
+];
 
-function StatCard({ label, value, color = 'var(--accent-primary)', delay = 0 }: { 
-  label: string; 
-  value: string | number; 
-  color?: string;
-  delay?: number;
+const QUICK_ACTIONS = [
+  {
+    href: '/gems',
+    label: 'Forgotten gems',
+    description: 'Resurface tracks you once had on repeat.',
+    tone: 'lime',
+  },
+  {
+    href: '/discover',
+    label: 'Find a new artist',
+    description: 'Branch out from the artists you already love.',
+    tone: 'blue',
+  },
+  {
+    href: '/playlists',
+    label: 'Build a playlist',
+    description: 'Turn a few anchors into a coherent listening arc.',
+    tone: 'orange',
+  },
+];
+
+function formatNumber(value: number) {
+  return new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(value);
+}
+
+function formatDate(value?: string | null) {
+  if (!value) return 'No plays yet';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'Recently';
+  return new Intl.DateTimeFormat('en', {
+    day: 'numeric',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date);
+}
+
+function StatTile({
+  label,
+  value,
+  note,
+  tone,
+}: {
+  label: string;
+  value: number;
+  note: string;
+  tone: 'lime' | 'blue' | 'orange' | 'neutral';
 }) {
   return (
-    <div 
-      className="stat-card animate-fade-in opacity-0"
-      style={{ animationDelay: `${delay}s` }}
-    >
-      <p className="text-[var(--text-muted)] text-sm font-medium uppercase tracking-wider">{label}</p>
-      <p className="text-4xl font-bold mt-2" style={{ color }}>{typeof value === 'number' ? value.toLocaleString() : value}</p>
-    </div>
+    <article className={`archive-stat archive-stat-${tone}`}>
+      <p className="archive-stat-label">{label}</p>
+      <p className="archive-stat-value">{formatNumber(value)}</p>
+      <p className="archive-stat-note">{note}</p>
+    </article>
   );
 }
 
-function CustomTooltip({ active, payload, label }: any) {
-  if (!active || !payload?.length) return null;
+function DashboardSkeleton() {
   return (
-    <div className="custom-tooltip">
-      <p className="font-medium text-[var(--text-primary)]">{label}</p>
-      <p className="text-[var(--accent-primary)]">{payload[0].value.toLocaleString()} plays</p>
+    <div className="dashboard-stack" aria-label="Loading listening archive" aria-busy="true">
+      <div className="skeleton h-40 rounded-[28px]" />
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        {[0, 1, 2, 3].map((item) => (
+          <div key={item} className="skeleton h-36 rounded-2xl" />
+        ))}
+      </div>
+      <div className="grid lg:grid-cols-[1.45fr_0.8fr] gap-5">
+        <div className="skeleton h-80 rounded-2xl" />
+        <div className="skeleton h-80 rounded-2xl" />
+      </div>
     </div>
   );
 }
 
 export default function Dashboard() {
-  const { data: overview, isLoading: loadingOverview } = useQuery({
-    queryKey: ['overview'],
-    queryFn: () => getOverview(),
+  const [contentType, setContentType] = useState<ContentType>('music');
+
+  const overviewQuery = useQuery({
+    queryKey: ['overview', contentType],
+    queryFn: () => getOverview(contentType),
+    retry: 1,
+  });
+  const statusQuery = useQuery({
+    queryKey: ['archiveStatus'],
+    queryFn: getArchiveStatus,
+    retry: 1,
+  });
+  const artistsQuery = useQuery({
+    queryKey: ['topArtists', contentType],
+    queryFn: () => getTopArtists(7, contentType),
+  });
+  const genresQuery = useQuery({
+    queryKey: ['topGenres', contentType],
+    queryFn: () => getTopGenres(10, contentType),
+  });
+  const patternsQuery = useQuery({
+    queryKey: ['listeningPatterns', contentType],
+    queryFn: () => getListeningPatterns(contentType),
+  });
+  const streaksQuery = useQuery({
+    queryKey: ['listeningStreaks', contentType],
+    queryFn: () => getListeningStreaks(contentType),
+  });
+  const tracksQuery = useQuery({
+    queryKey: ['topTracks', contentType],
+    queryFn: () => getTopTracks(6, contentType),
   });
 
-  const { data: artists } = useQuery({
-    queryKey: ['topArtists'],
-    queryFn: () => getTopArtists(8),
-  });
+  const refetchDashboard = () => {
+    void Promise.all([
+      overviewQuery.refetch(),
+      statusQuery.refetch(),
+      artistsQuery.refetch(),
+      genresQuery.refetch(),
+      patternsQuery.refetch(),
+      streaksQuery.refetch(),
+      tracksQuery.refetch(),
+    ]);
+  };
 
-  const { data: genres } = useQuery({
-    queryKey: ['topGenres'],
-    queryFn: () => getTopGenres(8),
-  });
+  if (overviewQuery.isPending) return <DashboardSkeleton />;
 
-  const { data: patterns } = useQuery({
-    queryKey: ['listeningPatterns'],
-    queryFn: () => getListeningPatterns(),
-  });
-
-  const { data: streaks } = useQuery({
-    queryKey: ['listeningStreaks'],
-    queryFn: () => getListeningStreaks(),
-  });
-
-  const { data: topTracks } = useQuery({
-    queryKey: ['topTracks'],
-    queryFn: () => getTopTracks(5),
-  });
-
-  if (loadingOverview) {
+  if (overviewQuery.isError || !overviewQuery.data) {
     return (
-      <div className="flex items-center justify-center min-h-[60vh]">
-        <div className="text-center">
-          <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-gradient-to-br from-[var(--accent-primary)] to-[var(--accent-secondary)] animate-pulse" />
-          <p className="text-[var(--text-muted)]">Loading your music story...</p>
-        </div>
-      </div>
+      <section className="archive-error" role="alert">
+        <div className="archive-error-mark">!</div>
+        <p className="eyebrow">Archive unavailable</p>
+        <h1>We couldn&apos;t reach your listening data.</h1>
+        <p>
+          The dashboard now reports connection problems instead of quietly pretending your archive is empty.
+          Check that the API is running, then try again.
+        </p>
+        <button type="button" className="btn-primary" onClick={refetchDashboard}>
+          Retry connection
+        </button>
+      </section>
     );
   }
 
+  const overview = overviewQuery.data;
+  const status = statusQuery.data;
+  const artists = artistsQuery.data ?? [];
+  const genres = genresQuery.data ?? [];
+  const patterns = patternsQuery.data;
+  const streaks = streaksQuery.data;
+  const tracks = tracksQuery.data ?? [];
+  const maxArtistPlays = Math.max(...artists.map((artist) => artist.play_count), 1);
+  const isRefreshing = [
+    overviewQuery,
+    statusQuery,
+    artistsQuery,
+    genresQuery,
+    patternsQuery,
+    streaksQuery,
+    tracksQuery,
+  ].some((query) => query.isFetching);
+
   return (
-    <div className="space-y-8">
-      {/* Header */}
-      <div className="animate-fade-in">
-        <h1 className="text-4xl font-bold mb-2">
-          Your <span className="gradient-text">Listening</span> Story
-        </h1>
-        <p className="text-[var(--text-secondary)]">
-          A deep dive into your musical journey
-        </p>
-      </div>
-
-      {/* Main Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        <StatCard 
-          label="Total Plays" 
-          value={overview?.total_plays || 0} 
-          delay={0.1}
-        />
-        <StatCard 
-          label="Unique Artists" 
-          value={overview?.unique_artists || 0} 
-          color="var(--accent-secondary)"
-          delay={0.15}
-        />
-        <StatCard 
-          label="Unique Tracks" 
-          value={overview?.unique_tracks || 0} 
-          color="var(--accent-tertiary)"
-          delay={0.2}
-        />
-      </div>
-
-      {/* Streaks */}
-      {streaks && (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          <div className="glass-card p-6 animate-fade-in opacity-0" style={{ animationDelay: '0.25s' }}>
-            <p className="text-sm text-[var(--text-muted)] mb-1">Current Streak</p>
-            <p className="text-3xl font-bold text-[var(--accent-tertiary)]">
-              {streaks.current_streak} <span className="text-lg font-normal text-[var(--text-muted)]">days</span>
-            </p>
+    <div className="dashboard-stack">
+      <section className="dashboard-hero">
+        <div className="dashboard-hero-copy">
+          <div className="archive-live-row">
+            <span className="archive-live-dot" aria-hidden="true" />
+            <span>Archive live</span>
+            <span className="archive-live-separator" aria-hidden="true">/</span>
+            <span>Latest play {formatDate(status?.latest_played_at)}</span>
           </div>
-          
-          <div className="glass-card p-6 animate-fade-in opacity-0" style={{ animationDelay: '0.3s' }}>
-            <p className="text-sm text-[var(--text-muted)] mb-1">Longest Streak</p>
-            <p className="text-3xl font-bold text-[var(--accent-primary)]">
-              {streaks.longest_streak} <span className="text-lg font-normal text-[var(--text-muted)]">days</span>
-            </p>
-          </div>
-          
-          <div className="glass-card p-6 animate-fade-in opacity-0" style={{ animationDelay: '0.35s' }}>
-            <p className="text-sm text-[var(--text-muted)] mb-1">Total Listening Days</p>
-            <p className="text-3xl font-bold text-[var(--accent-secondary)]">
-              {streaks.total_listening_days}
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* Listening Patterns */}
-      {patterns && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* By Hour */}
-          <div className="glass-card p-6 animate-fade-in opacity-0" style={{ animationDelay: '0.4s' }}>
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-semibold">Listening by Hour</h2>
-              <span className="badge badge-purple">Peak: {patterns.peak_hour_label}</span>
-            </div>
-            <div className="h-48">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={patterns.by_hour} margin={{ left: 0, right: 0 }}>
-                  <defs>
-                    <linearGradient id="hourGradient" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="var(--accent-primary)" stopOpacity={0.4} />
-                      <stop offset="100%" stopColor="var(--accent-primary)" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <XAxis 
-                    dataKey="label" 
-                    stroke="var(--text-muted)" 
-                    fontSize={10} 
-                    tickLine={false} 
-                    axisLine={false}
-                    interval={3}
-                  />
-                  <YAxis hide />
-                  <Tooltip content={<CustomTooltip />} />
-                  <Area 
-                    type="monotone" 
-                    dataKey="plays" 
-                    stroke="var(--accent-primary)" 
-                    strokeWidth={2}
-                    fill="url(#hourGradient)" 
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-
-          {/* By Day */}
-          <div className="glass-card p-6 animate-fade-in opacity-0" style={{ animationDelay: '0.45s' }}>
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-semibold">Listening by Day</h2>
-              <span className="badge badge-cyan">Peak: {patterns.peak_day_label}</span>
-            </div>
-            <div className="h-48">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={patterns.by_day} margin={{ left: 0, right: 0 }}>
-                  <XAxis 
-                    dataKey="label" 
-                    stroke="var(--text-muted)" 
-                    fontSize={12} 
-                    tickLine={false} 
-                    axisLine={false} 
-                  />
-                  <YAxis hide />
-                  <Tooltip content={<CustomTooltip />} cursor={{ fill: 'rgba(6, 182, 212, 0.1)' }} />
-                  <Bar dataKey="plays" radius={[4, 4, 0, 0]}>
-                    {patterns.by_day.map((entry, index) => (
-                      <Cell 
-                        key={index} 
-                        fill={index === patterns.peak_day ? 'var(--accent-secondary)' : 'var(--accent-secondary)'} 
-                        fillOpacity={index === patterns.peak_day ? 1 : 0.5}
-                      />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Charts Row */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Top Artists */}
-        <div className="glass-card p-6 animate-fade-in opacity-0" style={{ animationDelay: '0.5s' }}>
-          <h2 className="text-xl font-semibold mb-6">Top Artists</h2>
-          <div className="h-72">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={artists} layout="vertical" margin={{ left: 10, right: 20 }}>
-                <XAxis type="number" stroke="var(--text-muted)" fontSize={12} tickLine={false} axisLine={false} />
-                <YAxis 
-                  type="category" 
-                  dataKey="artist" 
-                  stroke="var(--text-muted)" 
-                  width={100} 
-                  tick={{ fontSize: 11, fill: 'var(--text-secondary)' }}
-                  tickLine={false}
-                  axisLine={false}
-                />
-                <Tooltip content={<CustomTooltip />} cursor={{ fill: 'rgba(124, 58, 237, 0.1)' }} />
-                <Bar dataKey="play_count" radius={[0, 8, 8, 0]}>
-                  {artists?.map((_, index) => (
-                    <Cell key={index} fill={COLORS[index % COLORS.length]} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
+          <p className="eyebrow">Personal listening archive</p>
+          <h1 className="dashboard-title">
+            Your listening,
+            <span> finally legible.</span>
+          </h1>
+          <p className="dashboard-intro">
+            {formatNumber(overview.total_plays)} plays, collected quietly and turned into patterns you can actually use.
+          </p>
         </div>
 
-        {/* Top Genres */}
-        <div className="glass-card p-6 animate-fade-in opacity-0" style={{ animationDelay: '0.55s' }}>
-          <h2 className="text-xl font-semibold mb-6">Top Genres</h2>
-          <div className="h-72">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={genres} layout="vertical" margin={{ left: 10, right: 20 }}>
-                <XAxis type="number" stroke="var(--text-muted)" fontSize={12} tickLine={false} axisLine={false} />
-                <YAxis 
-                  type="category" 
-                  dataKey="genre" 
-                  stroke="var(--text-muted)" 
-                  width={100} 
-                  tick={{ fontSize: 11, fill: 'var(--text-secondary)' }}
-                  tickLine={false}
-                  axisLine={false}
-                />
-                <Tooltip content={<CustomTooltip />} cursor={{ fill: 'rgba(6, 182, 212, 0.1)' }} />
-                <Bar dataKey="play_count" radius={[0, 8, 8, 0]}>
-                  {genres?.map((_, index) => (
-                    <Cell key={index} fill={index % 2 === 0 ? '#06b6d4' : '#22d3ee'} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-      </div>
-
-      {/* Top Tracks */}
-      {topTracks && topTracks.length > 0 && (
-        <div className="glass-card p-6 animate-fade-in opacity-0" style={{ animationDelay: '0.6s' }}>
-          <h2 className="text-xl font-semibold mb-4">Most Played Tracks</h2>
-          <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
-            {topTracks.map((track, index) => (
-              <div 
-                key={track.track_id} 
-                className="flex flex-col items-center text-center p-4 rounded-xl bg-[var(--bg-secondary)] hover:bg-[var(--bg-card-hover)] transition-colors"
+        <div className="dashboard-hero-controls">
+          <div className="content-switcher" role="group" aria-label="Choose content type">
+            {CONTENT_OPTIONS.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                aria-pressed={contentType === option.value}
+                onClick={() => setContentType(option.value)}
               >
-                <div className="relative mb-3">
-                  <div className="w-20 h-20 rounded-lg overflow-hidden bg-[var(--bg-card)]">
-                    {track.image_url ? (
-                      <img src={track.image_url} alt={track.track} className="w-full h-full object-cover" />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center text-[var(--text-muted)]">
-                        <svg className="w-8 h-8" viewBox="0 0 24 24" fill="currentColor">
-                          <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/>
-                        </svg>
-                      </div>
-                    )}
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            className="refresh-button"
+            onClick={refetchDashboard}
+            disabled={isRefreshing}
+          >
+            <span className={isRefreshing ? 'refresh-icon refresh-icon-spinning' : 'refresh-icon'} aria-hidden="true">↻</span>
+            {isRefreshing ? 'Refreshing' : 'Refresh'}
+          </button>
+        </div>
+      </section>
+
+      <section className="archive-stat-grid" aria-label="Listening summary">
+        <StatTile label="Archived plays" value={overview.total_plays} note="Across your full archive" tone="lime" />
+        <StatTile label="Distinct tracks" value={overview.unique_tracks} note="Songs and episodes" tone="blue" />
+        <StatTile label="Artists heard" value={overview.unique_artists} note="Unique credited artists" tone="orange" />
+        <StatTile
+          label="Listening days"
+          value={streaks?.total_listening_days ?? 0}
+          note={`${status?.database_count ?? 0} monthly databases`}
+          tone="neutral"
+        />
+      </section>
+
+      <section className="dashboard-primary-grid">
+        <article className="archive-panel rhythm-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Daily rhythm</p>
+              <h2>When you press play</h2>
+            </div>
+            {patterns && <span className="panel-callout">Peak at {patterns.peak_hour_label}</span>}
+          </div>
+          <div className="rhythm-chart" aria-label="Plays by hour of day">
+            <ResponsiveContainer
+              width="100%"
+              height="100%"
+              minWidth={0}
+              minHeight={260}
+              initialDimension={{ width: 720, height: 260 }}
+            >
+              <AreaChart data={patterns?.by_hour ?? []} margin={{ top: 12, right: 8, left: -22, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="rhythmFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="var(--accent-primary)" stopOpacity={0.45} />
+                    <stop offset="100%" stopColor="var(--accent-primary)" stopOpacity={0.02} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
+                <XAxis
+                  dataKey="label"
+                  tickLine={false}
+                  axisLine={false}
+                  interval={3}
+                  tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
+                />
+                <YAxis tickLine={false} axisLine={false} tick={{ fill: 'var(--text-muted)', fontSize: 11 }} />
+                <Tooltip
+                  cursor={{ stroke: 'rgba(183, 255, 94, 0.35)' }}
+                  contentStyle={{
+                    background: 'var(--bg-elevated)',
+                    border: '1px solid var(--border-strong)',
+                    borderRadius: 12,
+                  }}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="plays"
+                  stroke="var(--accent-primary)"
+                  strokeWidth={3}
+                  fill="url(#rhythmFill)"
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        </article>
+
+        <article className="archive-panel artist-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Heavy rotation</p>
+              <h2>Top artists</h2>
+            </div>
+          </div>
+          <ol className="artist-ranking">
+            {artists.map((artist, index) => (
+              <li key={artist.artist}>
+                <span className="artist-rank">{String(index + 1).padStart(2, '0')}</span>
+                <div className="artist-ranking-copy">
+                  <div className="artist-ranking-labels">
+                    <span title={artist.artist}>{artist.artist}</span>
+                    <strong>{artist.play_count.toLocaleString()}</strong>
                   </div>
-                  <div className="absolute -top-2 -left-2 w-6 h-6 rounded-full bg-[var(--accent-primary)] flex items-center justify-center text-xs font-bold">
-                    {index + 1}
+                  <div className="artist-meter" aria-hidden="true">
+                    <span style={{ width: `${(artist.play_count / maxArtistPlays) * 100}%` }} />
                   </div>
                 </div>
-                <p className="font-medium text-sm truncate w-full">{track.track}</p>
-                <p className="text-xs text-[var(--text-muted)] truncate w-full">{track.artist}</p>
-                <p className="text-xs text-[var(--accent-primary)] mt-1">{track.play_count} plays</p>
+              </li>
+            ))}
+          </ol>
+        </article>
+      </section>
+
+      <section className="insight-strip" aria-label="Listening highlights">
+        <div>
+          <span>Peak day</span>
+          <strong>{patterns?.peak_day_label ?? '—'}</strong>
+        </div>
+        <div>
+          <span>Current streak</span>
+          <strong>{streaks?.current_streak ?? 0} days</strong>
+        </div>
+        <div>
+          <span>Longest streak</span>
+          <strong>{streaks?.longest_streak ?? 0} days</strong>
+        </div>
+        <div className="weekday-chart">
+          <ResponsiveContainer
+            width="100%"
+            height="100%"
+            minWidth={0}
+            minHeight={72}
+            initialDimension={{ width: 560, height: 72 }}
+          >
+            <BarChart data={patterns?.by_day ?? []} margin={{ top: 6, right: 0, left: 0, bottom: 0 }}>
+              <XAxis dataKey="label" tickLine={false} axisLine={false} tick={{ fill: 'var(--text-muted)', fontSize: 10 }} />
+              <Bar dataKey="plays" fill="var(--accent-secondary)" radius={[5, 5, 2, 2]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </section>
+
+      <section className="dashboard-secondary-grid">
+        <article className="archive-panel genres-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Taste map</p>
+              <h2>Your defining genres</h2>
+            </div>
+          </div>
+          <div className="genre-cloud">
+            {genres.map((genre, index) => (
+              <div key={genre.genre} className={`genre-pill genre-pill-${(index % 3) + 1}`}>
+                <span>{genre.genre}</span>
+                <strong>{formatNumber(genre.play_count)}</strong>
               </div>
             ))}
           </div>
-        </div>
-      )}
+        </article>
 
-      {/* Quick Actions */}
-      <div className="glass-card p-6 animate-fade-in opacity-0" style={{ animationDelay: '0.65s' }}>
-        <h2 className="text-xl font-semibold mb-4">Quick Actions</h2>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <Link href="/gems" className="btn-secondary text-center py-4 rounded-xl hover:scale-105 transition-transform">
-            Find Forgotten Gems
-          </Link>
-          <Link href="/discover" className="btn-secondary text-center py-4 rounded-xl hover:scale-105 transition-transform">
-            Discover New Artists
-          </Link>
-          <Link href="/playlists" className="btn-secondary text-center py-4 rounded-xl hover:scale-105 transition-transform">
-            Build Custom Playlist
-          </Link>
-          <Link href="/podcasts" className="btn-secondary text-center py-4 rounded-xl hover:scale-105 transition-transform">
-            Podcast Stats
-          </Link>
+        <article className="archive-panel tracks-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Most replayed</p>
+              <h2>Tracks that stayed</h2>
+            </div>
+          </div>
+          <ol className="track-ranking">
+            {tracks.map((track, index) => (
+              <li key={track.track_id || `${track.artist}-${track.track}`}>
+                <span className="track-rank">{index + 1}</span>
+                <div className="track-art" aria-hidden="true">
+                  {track.image_url ? (
+                    <img src={track.image_url} alt="" />
+                  ) : (
+                    <span>♪</span>
+                  )}
+                </div>
+                <div className="track-copy">
+                  <strong title={track.track}>{track.track}</strong>
+                  <span title={track.artist}>{track.artist}</span>
+                </div>
+                <span className="track-count">{track.play_count} plays</span>
+              </li>
+            ))}
+          </ol>
+        </article>
+      </section>
+
+      <section className="action-section">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Do something with it</p>
+            <h2>Turn history into a next listen</h2>
+          </div>
         </div>
-      </div>
+        <div className="action-grid">
+          {QUICK_ACTIONS.map((action) => (
+            <Link key={action.href} href={action.href} className={`action-card action-card-${action.tone}`}>
+              <div>
+                <strong>{action.label}</strong>
+                <p>{action.description}</p>
+              </div>
+              <span aria-hidden="true">↗</span>
+            </Link>
+          ))}
+        </div>
+      </section>
     </div>
   );
 }

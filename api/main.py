@@ -4,12 +4,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import json
+import os
 
 from .services.analyzer import (
     get_overview, get_overview_split, get_top_artists_stats, get_top_genres_stats,
     get_listening_patterns, get_listening_streaks
 )
-from .db import get_top_tracks, search_user_tracks, get_recent_tracks
+from .db import get_archive_status, get_top_tracks, search_user_tracks, get_recent_tracks
 from .spotify_client import (
     enrich_tracks_with_spotify_data, create_playlist, search_tracks_advanced
 )
@@ -23,15 +24,42 @@ from .services.podcasts import (
 
 app = FastAPI(title="Spotify History Recommendations", version="2.0.0")
 
+configured_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        *configured_origins,
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 ContentTypeParam = Literal["all", "music", "podcast"]
+
+
+def enrich_tracks_if_available(tracks):
+    """Add Spotify metadata without making archive features depend on it."""
+    try:
+        return enrich_tracks_with_spotify_data(tracks)
+    except Exception:
+        return [
+            {
+                **track,
+                "image_url": None,
+                "album": None,
+                "preview_url": None,
+                "spotify_url": None,
+            }
+            for track in tracks
+        ]
 
 
 # Stats endpoints
@@ -62,8 +90,7 @@ def stats_genres(limit: int = 20, content_type: ContentTypeParam = "all"):
 @app.get("/api/stats/tracks")
 def stats_tracks(limit: int = 20, content_type: ContentTypeParam = "all"):
     """Get top tracks by play count with album art."""
-    tracks = get_top_tracks(limit, content_type)
-    return enrich_tracks_with_spotify_data(tracks)
+    return enrich_tracks_if_available(get_top_tracks(limit, content_type))
 
 
 @app.get("/api/stats/patterns")
@@ -222,6 +249,12 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/api/meta/status")
+def archive_status():
+    """Return archive freshness and database provenance for the UI."""
+    return get_archive_status()
+
+
 # === NEW VIBE-BASED PLAYLIST ENDPOINTS ===
 
 class VibePlaylistRequest(BaseModel):
@@ -376,8 +409,7 @@ def tracks_recent(days: int = 7, limit: int = 20):
 
     Great for picking anchor tracks based on what you've been listening to.
     """
-    tracks = get_recent_tracks(days=days, limit=limit)
-    return enrich_tracks_with_spotify_data(tracks)
+    return enrich_tracks_if_available(get_recent_tracks(days=days, limit=limit))
 
 
 @app.get("/api/tracks/history/search")
@@ -390,5 +422,4 @@ def tracks_history_search(q: str, limit: int = 20):
     if not q or len(q) < 2:
         raise HTTPException(status_code=400, detail="Query must be at least 2 characters")
 
-    tracks = search_user_tracks(q, limit=limit)
-    return enrich_tracks_with_spotify_data(tracks)
+    return enrich_tracks_if_available(search_user_tracks(q, limit=limit))

@@ -86,5 +86,18 @@ def find_forgotten_gems(
     gems.sort(key=lambda x: x["score"], reverse=True)
     top_gems = gems[:limit]
     
-    # Enrich with Spotify data (album art, etc.)
-    return enrich_tracks_with_spotify_data(top_gems)
+    # Album art is optional: the archive-derived ranking should still work when
+    # Spotify credentials are unavailable or temporarily need refreshing.
+    try:
+        return enrich_tracks_with_spotify_data(top_gems)
+    except Exception:
+        return [
+            {
+                **gem,
+                "image_url": None,
+                "album": None,
+                "preview_url": None,
+                "spotify_url": None,
+            }
+            for gem in top_gems
+        ]

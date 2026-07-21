@@ -5,7 +5,7 @@ import { getNewArtists } from '@/lib/api';
 import ArtistCard from '@/components/ArtistCard';
 
 export default function DiscoverPage() {
-  const { data: artists, isLoading, error } = useQuery({
+  const { data: artists, isLoading, error, refetch, isFetching } = useQuery({
     queryKey: ['newArtists'],
     queryFn: () => getNewArtists(20),
   });
@@ -34,9 +34,15 @@ export default function DiscoverPage() {
 
   if (error) {
     return (
-      <div className="text-center py-20">
-        <p className="text-[var(--text-muted)]">Failed to load recommendations</p>
-      </div>
+      <section className="archive-error" role="alert">
+        <div className="archive-error-mark">!</div>
+        <p className="eyebrow">Discovery unavailable</p>
+        <h1>Spotify-powered suggestions aren&apos;t reachable.</h1>
+        <p>Your listening archive still works. Discovery needs an active Spotify connection before it can look beyond it.</p>
+        <button type="button" className="btn-primary" disabled={isFetching} onClick={() => void refetch()}>
+          {isFetching ? 'Trying again' : 'Retry'}
+        </button>
+      </section>
     );
   }
 
@@ -48,7 +54,7 @@ export default function DiscoverPage() {
           <span className="gradient-text">Discover</span> New Artists
         </h1>
         <p className="text-[var(--text-secondary)]">
-          Artists similar to your favorites that you haven't heard yet
+          Artists similar to your favorites that you haven&apos;t heard yet
         </p>
       </div>
 
@@ -86,7 +92,7 @@ export default function DiscoverPage() {
 
       {artists?.length === 0 && (
         <div className="text-center py-16 glass-card">
-          <h3 className="text-xl font-semibold mb-2">You've heard everyone!</h3>
+          <h3 className="text-xl font-semibold mb-2">You&apos;ve heard everyone!</h3>
           <p className="text-[var(--text-muted)]">
             No new artists found. You must have great taste!
           </p>

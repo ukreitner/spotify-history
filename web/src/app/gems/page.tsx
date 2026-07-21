@@ -5,7 +5,7 @@ import { getForgottenGems } from '@/lib/api';
 import TrackCard from '@/components/TrackCard';
 
 export default function GemsPage() {
-  const { data: gems, isLoading, error } = useQuery({
+  const { data: gems, isLoading, error, refetch, isFetching } = useQuery({
     queryKey: ['forgottenGems'],
     queryFn: () => getForgottenGems(),
   });
@@ -38,9 +38,15 @@ export default function GemsPage() {
 
   if (error) {
     return (
-      <div className="text-center py-20">
-        <p className="text-[var(--text-muted)]">Failed to load forgotten gems</p>
-      </div>
+      <section className="archive-error" role="alert">
+        <div className="archive-error-mark">!</div>
+        <p className="eyebrow">Gems unavailable</p>
+        <h1>We couldn&apos;t search your archive.</h1>
+        <p>Your history is safe. The recommendation service may be offline or waiting for refreshed Spotify access.</p>
+        <button type="button" className="btn-primary" disabled={isFetching} onClick={() => void refetch()}>
+          {isFetching ? 'Trying again' : 'Retry'}
+        </button>
+      </section>
     );
   }
 
@@ -52,7 +58,7 @@ export default function GemsPage() {
           <span className="gradient-text">Forgotten</span> Gems
         </h1>
         <p className="text-[var(--text-secondary)]">
-          Tracks you loved but haven't played in a while. Time to rediscover!
+          Tracks you loved but haven&apos;t played in a while. Time to rediscover!
         </p>
       </div>
 
@@ -100,7 +106,7 @@ export default function GemsPage() {
         <div className="text-center py-16 glass-card">
           <h3 className="text-xl font-semibold mb-2">No forgotten gems!</h3>
           <p className="text-[var(--text-muted)]">
-            You've been keeping up with all your favorites. Keep listening!
+            You&apos;ve been keeping up with all your favorites. Keep listening!
           </p>
         </div>
       )}
