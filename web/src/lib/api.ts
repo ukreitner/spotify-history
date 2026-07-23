@@ -323,6 +323,32 @@ export interface FrogTrack {
   transition_similarity?: number | null;
 }
 
+export interface FrogGraphNode {
+  id: string;
+  artist: string;
+  track: string;
+  direction: 'forward' | 'backward' | 'route';
+  depth: number;
+  state: 'discovered' | 'expanded' | 'start' | 'bridge' | 'end' | string;
+  route_position?: number;
+  track_id?: string;
+  image_url?: string | null;
+}
+
+export interface FrogGraphEdge {
+  id: string;
+  source: string;
+  target: string;
+  similarity: number;
+  direction: 'forward' | 'backward' | 'route';
+  kind: 'search' | 'route';
+}
+
+export interface FrogExploration {
+  nodes: FrogGraphNode[];
+  edges: FrogGraphEdge[];
+}
+
 export interface FrogPlaylistRequest {
   start_track_id: string;
   end_track_id: string;
@@ -339,6 +365,7 @@ export interface FrogPlaylistResult {
   average_transition?: number;
   meets_smoothness_target?: boolean;
   quality_warning?: string | null;
+  exploration?: FrogExploration;
   success: boolean;
   error?: string;
 }
@@ -366,6 +393,7 @@ export interface FrogProgressEvent {
   batch?: number;
   elapsed_seconds?: number;
   weakest_transition?: number;
+  exploration?: FrogExploration;
 }
 
 export interface FrogResultEvent {
@@ -379,6 +407,7 @@ export interface FrogResultEvent {
   average_transition?: number;
   meets_smoothness_target?: boolean;
   quality_warning?: string | null;
+  exploration?: FrogExploration;
   success: boolean;
 }
 
@@ -388,6 +417,39 @@ export interface FrogErrorEvent {
 }
 
 export type FrogStreamEvent = FrogProgressEvent | FrogResultEvent | FrogErrorEvent;
+
+export interface FrogAlternative {
+  track: FrogTrack;
+  left_similarity: number;
+  right_similarity: number;
+  bottleneck_similarity: number;
+  average_similarity: number;
+  improvement: number;
+}
+
+export interface FrogAlternativesResult {
+  position: number;
+  left_track: FrogTrack;
+  current_track: FrogTrack;
+  right_track: FrogTrack;
+  current_bottleneck: number;
+  alternatives: FrogAlternative[];
+}
+
+export const getFrogAlternatives = (
+  trackIds: string[],
+  position: number,
+  currentLeftSimilarity?: number | null,
+  currentRightSimilarity?: number | null,
+  limit = 8,
+) =>
+  api.post<FrogAlternativesResult>('/recommendations/frog/alternatives', {
+    track_ids: trackIds,
+    position,
+    limit,
+    current_left_similarity: currentLeftSimilarity,
+    current_right_similarity: currentRightSimilarity,
+  }).then(r => r.data);
 
 export const generateFrogPlaylistStreaming = (
   request: FrogPlaylistRequest,

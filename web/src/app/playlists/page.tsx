@@ -7,16 +7,66 @@ import {
   AnchorTrack,
   FlowMode,
   VibePlaylistResult,
+  FrogAlternative,
+  FrogExploration,
   FrogPlaylistResult,
   FrogProgressEvent,
+  FrogTrack,
   createPlaylist,
   generateVibePlaylist,
   generateFrogPlaylistStreaming,
 } from '@/lib/api';
 import TrackCard from '@/components/TrackCard';
 import AnchorTrackPicker from '@/components/AnchorTrackPicker';
+import FrogGraphExplorer from '@/components/FrogGraphExplorer';
 
 type PlaylistMode = 'vibe' | 'frog';
+
+function mergeExploration(
+  current: FrogExploration,
+  incoming?: FrogExploration,
+): FrogExploration {
+  if (!incoming) return current;
+  const nodes = new Map(current.nodes.map((node) => [node.id, node]));
+  const edges = new Map(current.edges.map((edge) => [edge.id, edge]));
+  incoming.nodes.forEach((node) => nodes.set(node.id, node));
+  incoming.edges.forEach((edge) => edges.set(edge.id, edge));
+  return {
+    nodes: Array.from(nodes.values()),
+    edges: Array.from(edges.values()),
+  };
+}
+
+function explorationWithRoute(
+  exploration: FrogExploration,
+  tracks: FrogTrack[],
+): FrogExploration {
+  const searchNodes = exploration.nodes.filter((node) => node.direction !== 'route');
+  const searchEdges = exploration.edges.filter((edge) => edge.kind !== 'route');
+  const routeNodes = tracks.map((track, position) => ({
+    id: `spotify:${track.track_id}`,
+    artist: track.artist,
+    track: track.track,
+    direction: 'route' as const,
+    depth: position,
+    state: track.role,
+    route_position: position,
+    track_id: track.track_id,
+    image_url: track.image_url,
+  }));
+  const routeEdges = tracks.slice(1).map((track, offset) => ({
+    id: `route:spotify:${tracks[offset].track_id}>spotify:${track.track_id}`,
+    source: `spotify:${tracks[offset].track_id}`,
+    target: `spotify:${track.track_id}`,
+    similarity: track.transition_similarity ?? 0,
+    direction: 'route' as const,
+    kind: 'route' as const,
+  }));
+  return {
+    nodes: [...searchNodes, ...routeNodes],
+    edges: [...searchEdges, ...routeEdges],
+  };
+}
 
 export default function PlaylistsPage() {
   const [mode, setMode] = useState<PlaylistMode>('vibe');
@@ -49,6 +99,12 @@ export default function PlaylistsPage() {
   const [frogProgress, setFrogProgress] = useState<FrogProgressEvent | null>(null);
   const [frogLoading, setFrogLoading] = useState(false);
   const [frogError, setFrogError] = useState<string | null>(null);
+  const [showFrogExplorer, setShowFrogExplorer] = useState(false);
+  const [frogExploration, setFrogExploration] = useState<FrogExploration>({
+    nodes: [],
+    edges: [],
+  });
+  const [frogOriginalResult, setFrogOriginalResult] = useState<FrogPlaylistResult | null>(null);
   const cancelFrogRef = useRef<(() => void) | null>(null);
 
   const generateVibeMutation = useMutation({
@@ -80,6 +136,8 @@ export default function PlaylistsPage() {
     setFrogError(null);
     setFrogProgress(null);
     setFrogResult(null);
+    setFrogOriginalResult(null);
+    setFrogExploration({ nodes: [], edges: [] });
 
     cancelFrogRef.current = generateFrogPlaylistStreaming(
       {
@@ -89,12 +147,20 @@ export default function PlaylistsPage() {
       },
       (progress) => {
         setFrogProgress(progress);
+        if (progress.exploration) {
+          setFrogExploration((current) => mergeExploration(current, progress.exploration));
+        }
       },
       (result) => {
         cancelFrogRef.current = null;
         setFrogLoading(false);
         setFrogProgress(null);
         setFrogResult(result);
+        setFrogOriginalResult({
+          ...result,
+          tracks: result.tracks.map((track) => ({ ...track })),
+        });
+        setFrogExploration(result.exploration || { nodes: [], edges: [] });
       },
       (error) => {
         cancelFrogRef.current = null;
@@ -112,6 +178,56 @@ export default function PlaylistsPage() {
     setFrogProgress(null);
     setFrogError('Route search cancelled.');
   }, []);
+
+  const handleFrogReplace = useCallback((
+    position: number,
+    alternative: FrogAlternative,
+  ) => {
+    if (
+      !frogResult
+      || position <= 0
+      || position >= frogResult.tracks.length - 1
+    ) return;
+
+    const tracks = frogResult.tracks.map((track) => ({ ...track }));
+    tracks[position] = {
+      ...alternative.track,
+      position,
+      role: 'bridge',
+      transition_similarity: alternative.left_similarity,
+    };
+    tracks[position + 1] = {
+      ...tracks[position + 1],
+      transition_similarity: alternative.right_similarity,
+    };
+    const transitionScores = tracks
+      .slice(1)
+      .map((track) => track.transition_similarity ?? 0);
+    const weakest = Math.min(...transitionScores);
+    const average = transitionScores.reduce((sum, score) => sum + score, 0)
+      / transitionScores.length;
+    setFrogResult({
+      ...frogResult,
+      tracks,
+      weakest_transition: weakest,
+      average_transition: average,
+      meets_smoothness_target: weakest >= 0.12,
+      quality_warning: weakest < 0.12
+        ? `This edited route has a ${(weakest * 100).toFixed(0)}% weakest similarity signal.`
+        : null,
+    });
+    setFrogExploration((graph) => explorationWithRoute(graph, tracks));
+  }, [frogResult]);
+
+  const handleFrogReset = useCallback(() => {
+    if (!frogOriginalResult) return;
+    const restored = {
+      ...frogOriginalResult,
+      tracks: frogOriginalResult.tracks.map((track) => ({ ...track })),
+    };
+    setFrogResult(restored);
+    setFrogExploration(restored.exploration || { nodes: [], edges: [] });
+  }, [frogOriginalResult]);
 
   const createMutation = useMutation({
     mutationFn: ({ name, trackIds }: { name: string; trackIds: string[] }) =>
@@ -187,6 +303,11 @@ export default function PlaylistsPage() {
     : vibeError instanceof Error
       ? vibeError.message
       : 'Failed to generate playlist.';
+  const frogRouteEdited = !!frogResult
+    && !!frogOriginalResult
+    && frogResult.tracks.some(
+      (track, index) => track.track_id !== frogOriginalResult.tracks[index]?.track_id,
+    );
 
   return (
     <div className="space-y-6">
@@ -542,6 +663,23 @@ export default function PlaylistsPage() {
           {/* Frog mode explanation / progress */}
           {mode === 'frog' && (
             <div className="glass-card p-4">
+              <div className="flex items-center justify-between gap-3 mb-3">
+                <div className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">
+                  Graph lab
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowFrogExplorer((visible) => !visible)}
+                  aria-pressed={showFrogExplorer}
+                  className={`px-3 py-2 rounded-lg text-xs border transition-colors ${
+                    showFrogExplorer
+                      ? 'bg-[var(--accent-secondary)]/15 border-[var(--accent-secondary)]/50 text-[var(--accent-secondary)]'
+                      : 'bg-[var(--bg-secondary)] border-[var(--border-soft)] text-[var(--text-secondary)]'
+                  }`}
+                >
+                  {showFrogExplorer ? 'Hide exploration' : 'Show exploration'}
+                </button>
+              </div>
               {frogProgress ? (
                 <div className="space-y-3">
                   <div className="flex items-center gap-2">
@@ -898,6 +1036,20 @@ export default function PlaylistsPage() {
           )}
         </div>
       </div>
+
+      {mode === 'frog'
+        && showFrogExplorer
+        && (frogLoading || !!frogResult || frogExploration.nodes.length > 0)
+        && (
+          <FrogGraphExplorer
+            exploration={frogExploration}
+            tracks={frogResult?.tracks || []}
+            isLoading={frogLoading}
+            canReset={frogRouteEdited}
+            onReplace={handleFrogReplace}
+            onReset={handleFrogReset}
+          />
+        )}
     </div>
   );
 }

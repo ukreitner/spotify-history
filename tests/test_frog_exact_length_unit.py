@@ -6,6 +6,7 @@ from unittest.mock import patch
 from api.services.frog_playlist import (
     astar_find_path_streaming,
     expand_path_to_exact_length,
+    get_frog_alternatives,
     track_key,
 )
 
@@ -227,6 +228,95 @@ class FrogExactLengthTests(unittest.TestCase):
         )
         self.assertEqual(1, result["iterations"])
         self.assertEqual(1, len(calls))
+
+    def test_search_progress_contains_real_graph_delta(self):
+        start = node("A")
+        middle = node("M", match=0.8)
+        end = node("Z")
+
+        def fetch(tracks, limit=30, max_workers=20):
+            del limit, max_workers
+            return {
+                (start["artist"], start["name"]): [middle],
+                (end["artist"], end["name"]): [middle],
+            }
+
+        def progress(iteration, visited, queue_size, best_h, current, exploration):
+            del iteration, visited, queue_size, best_h, current
+            return {
+                "type": "progress",
+                "phase": "search",
+                "exploration": exploration,
+            }
+
+        with patch("api.services.frog_playlist.get_similar_tracks_batch", fetch):
+            events = list(astar_find_path_streaming(start, end, progress))
+
+        graph_event = next(
+            event
+            for event in events
+            if event.get("type") == "progress" and event.get("exploration")
+        )
+        node_ids = {item["id"] for item in graph_event["exploration"]["nodes"]}
+        self.assertIn("artist a::track a", node_ids)
+        self.assertIn("artist m::track m", node_ids)
+        self.assertTrue(graph_event["exploration"]["edges"])
+
+    def test_alternatives_improve_both_sides_of_a_bridge(self):
+        route_nodes = {name: node(name) for name in ("A", "C", "Z")}
+        candidate = node("B")
+        graph = {
+            track_key(route_nodes["A"]): [
+                {**route_nodes["C"], "match": 0.2},
+                {**candidate, "match": 0.8},
+            ],
+            track_key(route_nodes["C"]): [
+                {**route_nodes["A"], "match": 0.2},
+                {**route_nodes["Z"], "match": 0.3},
+            ],
+            track_key(route_nodes["Z"]): [
+                {**route_nodes["C"], "match": 0.3},
+                {**candidate, "match": 0.7},
+            ],
+            track_key(candidate): [
+                {**route_nodes["A"], "match": 0.8},
+                {**route_nodes["Z"], "match": 0.7},
+            ],
+        }
+        spotify_tracks = {
+            name: self.resolve(f"Artist {name}", f"Track {name}")
+            for name in ("A", "C", "Z")
+        }
+
+        def fetch_tracks(track_ids):
+            by_id = {track["id"]: track for track in spotify_tracks.values()}
+            return [by_id[track_id] for track_id in track_ids]
+
+        def fetch_similar(tracks, limit=100, max_workers=20):
+            del limit, max_workers
+            return {
+                pair: graph.get(
+                    track_key({"artist": pair[0], "name": pair[1]}),
+                    [],
+                )
+                for pair in tracks
+            }
+
+        result = get_frog_alternatives(
+            [spotify_tracks[name]["id"] for name in ("A", "C", "Z")],
+            1,
+            track_fetcher=fetch_tracks,
+            spotify_resolver=self.resolve,
+            similarity_fetcher=fetch_similar,
+        )
+
+        self.assertEqual(0.2, result["current_bottleneck"])
+        self.assertEqual(1, len(result["alternatives"]))
+        alternative = result["alternatives"][0]
+        self.assertEqual("Track B", alternative["track"]["track"])
+        self.assertEqual(0.8, alternative["left_similarity"])
+        self.assertEqual(0.7, alternative["right_similarity"])
+        self.assertEqual(0.5, alternative["improvement"])
 
 
 if __name__ == "__main__":

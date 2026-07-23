@@ -230,6 +230,11 @@ def track_key(track: Dict) -> Tuple[str, str]:
     )
 
 
+def graph_node_id(track: Dict) -> str:
+    """Stable browser-safe identity shared by search and final route graphs."""
+    return "::".join(track_key(track))
+
+
 def _spotify_id(track: Optional[Dict]) -> Optional[str]:
     return track.get("id") if track else None
 
@@ -282,6 +287,22 @@ def _transition_similarity(
         if fallback is not None:
             observations.append(float(fallback))
 
+    return max(observations, default=0.0)
+
+
+def _observed_transition_similarity(
+    left: Dict,
+    right: Dict,
+    cache: Dict[Tuple[str, str], Dict[Tuple[str, str], Tuple[Dict, float]]],
+) -> float:
+    """Similarity supported by an explicit Last.fm edge in either direction."""
+    left_key = track_key(left)
+    right_key = track_key(right)
+    observations: List[float] = []
+    if right_key in cache.get(left_key, {}):
+        observations.append(cache[left_key][right_key][1])
+    if left_key in cache.get(right_key, {}):
+        observations.append(cache[right_key][left_key][1])
     return max(observations, default=0.0)
 
 
@@ -769,17 +790,40 @@ def _build_exact_result(
 
     scores = quality["transition_scores"]
     spotify_tracks = []
+    route_graph_nodes = []
+    route_graph_edges = []
     for index, node in enumerate(exact_path):
         role = "start" if index == 0 else ("end" if index == len(exact_path) - 1 else "bridge")
         transition = None if index == 0 else scores[index - 1]
-        spotify_tracks.append(
-            format_track(
-                node["_spotify"],
-                index,
-                role,
-                transition_similarity=transition,
-            )
+        formatted = format_track(
+            node["_spotify"],
+            index,
+            role,
+            transition_similarity=transition,
         )
+        spotify_tracks.append(formatted)
+        route_graph_nodes.append({
+            "id": graph_node_id(node),
+            "artist": formatted["artist"],
+            "track": formatted["track"],
+            "direction": "route",
+            "depth": index,
+            "state": role,
+            "route_position": index,
+            "track_id": formatted["track_id"],
+            "image_url": formatted["image_url"],
+        })
+        if index:
+            source_id = graph_node_id(exact_path[index - 1])
+            target_id = graph_node_id(node)
+            route_graph_edges.append({
+                "id": f"route:{source_id}>{target_id}",
+                "source": source_id,
+                "target": target_id,
+                "similarity": transition,
+                "direction": "route",
+                "kind": "route",
+            })
 
     return {
         "tracks": spotify_tracks,
@@ -791,6 +835,10 @@ def _build_exact_result(
         "average_transition": quality["average_transition"],
         "meets_smoothness_target": quality["meets_smoothness_target"],
         "quality_warning": quality.get("quality_warning"),
+        "exploration": {
+            "nodes": route_graph_nodes,
+            "edges": route_graph_edges,
+        },
         "success": len(spotify_tracks) == track_count,
     }
 
@@ -922,7 +970,14 @@ def generate_frog_playlist_streaming(
     }
 
     # Find path using A* with progress callback
-    def progress_callback(iteration, visited, queue_size, best_h, current):
+    def progress_callback(
+        iteration,
+        visited,
+        queue_size,
+        best_h,
+        current,
+        exploration,
+    ):
         return {
             "type": "progress",
             "phase": "search",
@@ -931,13 +986,21 @@ def generate_frog_playlist_streaming(
             "queue_size": queue_size,
             "best_h": best_h,
             "current_track": f"{current['artist'][:25]} - {current['name'][:30]}",
+            "exploration": exploration,
         }
 
     path = None
+    exploration_nodes: Dict[str, Dict] = {}
+    exploration_edges: Dict[str, Dict] = {}
     for event in astar_find_path_streaming(start, end, progress_callback):
         if event.get("type") == "result":
             path = event.get("path")
         else:
+            exploration = event.get("exploration", {})
+            for node in exploration.get("nodes", []):
+                exploration_nodes[node["id"]] = node
+            for edge in exploration.get("edges", []):
+                exploration_edges[edge["id"]] = edge
             yield event
 
     if not path:
@@ -997,6 +1060,16 @@ def generate_frog_playlist_streaming(
             "error": result.get("error", "Could not build the requested route."),
         }
         return
+
+    route_exploration = result.get("exploration", {})
+    for node in route_exploration.get("nodes", []):
+        exploration_nodes[node["id"]] = node
+    for edge in route_exploration.get("edges", []):
+        exploration_edges[edge["id"]] = edge
+    result["exploration"] = {
+        "nodes": list(exploration_nodes.values()),
+        "edges": list(exploration_edges.values()),
+    }
 
     yield {"type": "result", **result}
 
@@ -1063,6 +1136,24 @@ def astar_find_path_streaming(
         "neighborhood_2hop": 0,
     }
 
+    def make_progress_event(current, graph_nodes, graph_edges):
+        if not progress_callback:
+            return None
+        total_visited = len(visited_f) + len(visited_b)
+        total_queue = len(open_f) + len(open_b)
+        progress_pct = min(0.9, total_visited / 100)
+        return progress_callback(
+            iterations,
+            total_visited,
+            total_queue,
+            1 - progress_pct,
+            current,
+            {
+                "nodes": list(graph_nodes.values()),
+                "edges": list(graph_edges.values()),
+            },
+        )
+
     while (open_f or open_b) and iterations < max_iterations:
         # Check time limit
         elapsed = time.monotonic() - start_time
@@ -1100,6 +1191,30 @@ def astar_find_path_streaming(
         if not to_expand_f and not to_expand_b:
             break
 
+        graph_nodes: Dict[str, Dict] = {}
+        graph_edges: Dict[str, Dict] = {}
+
+        for _, _, data, path in to_expand_f:
+            node_id = graph_node_id(data)
+            graph_nodes[node_id] = {
+                "id": node_id,
+                "artist": data["artist"],
+                "track": data["name"],
+                "direction": "forward",
+                "depth": len(path) - 1,
+                "state": "expanded",
+            }
+        for _, _, data, path in to_expand_b:
+            node_id = graph_node_id(data)
+            graph_nodes[node_id] = {
+                "id": node_id,
+                "artist": data["artist"],
+                "track": data["name"],
+                "direction": "backward",
+                "depth": len(path) - 1,
+                "state": "expanded",
+            }
+
         # Mark visited and check for meeting point BEFORE fetching neighbors
         for g, key, data, path in to_expand_f:
             visited_f[key] = (g, path)
@@ -1107,6 +1222,9 @@ def astar_find_path_streaming(
                 _, path_b = discovered_b[key]
                 complete_path = path[:-1] + list(reversed(path_b))
                 print(f"[BiA*] Found path in {iterations} batches!")
+                progress_event = make_progress_event(data, graph_nodes, graph_edges)
+                if progress_event:
+                    yield progress_event
                 yield {"type": "result", "path": complete_path, "iterations": iterations}
                 return
 
@@ -1116,6 +1234,9 @@ def astar_find_path_streaming(
                 _, path_f = discovered_f[key]
                 complete_path = path_f[:-1] + list(reversed(path))
                 print(f"[BiA*] Found path in {iterations} batches!")
+                progress_event = make_progress_event(data, graph_nodes, graph_edges)
+                if progress_event:
+                    yield progress_event
                 yield {"type": "result", "path": complete_path, "iterations": iterations}
                 return
 
@@ -1140,6 +1261,30 @@ def astar_find_path_streaming(
             # Process results
             for track_tuple, similar in batch_results.items():
                 direction, parent_key, parent_data, parent_path = track_info[track_tuple]
+                graph_direction = "forward" if direction == "f" else "backward"
+                parent_id = graph_node_id(parent_data)
+                parent_depth = len(parent_path) - 1
+                for neighbor in similar[:5]:
+                    neighbor_id = graph_node_id(neighbor)
+                    if not all(track_key(neighbor)):
+                        continue
+                    graph_nodes[neighbor_id] = {
+                        "id": neighbor_id,
+                        "artist": neighbor["artist"],
+                        "track": neighbor["name"],
+                        "direction": graph_direction,
+                        "depth": parent_depth + 1,
+                        "state": "discovered",
+                    }
+                    edge_id = f"{graph_direction}:{parent_id}>{neighbor_id}"
+                    graph_edges[edge_id] = {
+                        "id": edge_id,
+                        "source": parent_id,
+                        "target": neighbor_id,
+                        "similarity": round(float(neighbor.get("match", 0.0)), 4),
+                        "direction": graph_direction,
+                        "kind": "search",
+                    }
                 parent_g = (
                     best_g_f[parent_key]
                     if direction == "f"
@@ -1163,6 +1308,13 @@ def astar_find_path_streaming(
                             _, path_b = discovered_b[neighbor_key]
                             complete_path = new_path[:-1] + list(reversed(path_b))
                             print(f"[BiA*] Frontiers met in {iterations} batches!")
+                            progress_event = make_progress_event(
+                                neighbor,
+                                graph_nodes,
+                                graph_edges,
+                            )
+                            if progress_event:
+                                yield progress_event
                             yield {
                                 "type": "result",
                                 "path": complete_path,
@@ -1183,6 +1335,13 @@ def astar_find_path_streaming(
                             _, path_f = discovered_f[neighbor_key]
                             complete_path = path_f[:-1] + list(reversed(new_path))
                             print(f"[BiA*] Frontiers met in {iterations} batches!")
+                            progress_event = make_progress_event(
+                                neighbor,
+                                graph_nodes,
+                                graph_edges,
+                            )
+                            if progress_event:
+                                yield progress_event
                             yield {
                                 "type": "result",
                                 "path": complete_path,
@@ -1197,15 +1356,14 @@ def astar_find_path_streaming(
 
         # Progress update
         if progress_callback:
-            total_visited = len(visited_f) + len(visited_b)
-            total_queue = len(open_f) + len(open_b)
-            progress_pct = min(0.9, total_visited / 100)
             current = (
                 to_expand_f[0][2]
                 if to_expand_f
                 else (to_expand_b[0][2] if to_expand_b else start)
             )
-            yield progress_callback(iterations, total_visited, total_queue, 1 - progress_pct, current)
+            progress_event = make_progress_event(current, graph_nodes, graph_edges)
+            if progress_event:
+                yield progress_event
 
     # No direct path found - try to find closest meeting point
     print(f"[BiA*] No direct path after {iterations} batches, checking for close approaches...")
@@ -1258,4 +1416,164 @@ def format_track(
         "position": position,
         "role": role,
         "transition_similarity": transition_similarity,
+    }
+
+
+def get_frog_alternatives(
+    track_ids: List[str],
+    position: int,
+    limit: int = 8,
+    *,
+    current_left_similarity: Optional[float] = None,
+    current_right_similarity: Optional[float] = None,
+    track_fetcher: Callable[[List[str]], List[Dict]] = get_tracks_bulk,
+    spotify_resolver: Callable[[str, str], Optional[Dict]] = resolve_to_spotify,
+    similarity_fetcher: Callable = get_similar_tracks_batch,
+) -> Dict:
+    """
+    Find Spotify replacements that fit both neighbors of one route position.
+
+    Endpoints are immutable. Candidates are ranked by their weaker adjacent
+    edge first, so a swap cannot hide one bad jump behind one excellent jump.
+    """
+    if len(track_ids) < 3:
+        raise ValueError("A Frog route needs at least three tracks.")
+    if position <= 0 or position >= len(track_ids) - 1:
+        raise ValueError("Only bridge tracks can be replaced.")
+    if limit < 1 or limit > 16:
+        raise ValueError("Alternative limit must be between 1 and 16.")
+
+    fetched = track_fetcher(track_ids)
+    fetched_by_id = {
+        track.get("id"): track
+        for track in fetched
+        if track and track.get("id")
+    }
+    if any(track_id not in fetched_by_id for track_id in track_ids):
+        raise ValueError("Could not load every track in the current route.")
+
+    route = []
+    for track_id in track_ids:
+        spotify_track = fetched_by_id[track_id]
+        route.append({
+            "artist": spotify_track.get("artists", [{}])[0].get("name", ""),
+            "name": spotify_track.get("name", ""),
+            "_spotify": spotify_track,
+        })
+
+    left = route[position - 1]
+    current = route[position]
+    right = route[position + 1]
+    adjacency: Dict[
+        Tuple[str, str],
+        Dict[Tuple[str, str], Tuple[Dict, float]],
+    ] = {}
+    _adjacency_for([left, current, right], adjacency, similarity_fetcher, 100)
+
+    used_keys = {track_key(node) for node in route}
+    used_spotify_ids = set(track_ids)
+    candidate_by_key: Dict[Tuple[str, str], Dict] = {}
+    initial_strength: Dict[Tuple[str, str], float] = {}
+
+    for endpoint in (left, current, right):
+        for key, (candidate, score) in adjacency.get(track_key(endpoint), {}).items():
+            if key in used_keys:
+                continue
+            candidate_by_key[key] = candidate
+            initial_strength[key] = max(initial_strength.get(key, 0.0), score)
+
+    candidate_nodes = sorted(
+        candidate_by_key.values(),
+        key=lambda node: initial_strength.get(track_key(node), 0.0),
+        reverse=True,
+    )[: max(80, limit * 12)]
+    _adjacency_for(candidate_nodes, adjacency, similarity_fetcher, 100)
+
+    scored_candidates = []
+    for candidate in candidate_nodes:
+        left_score = _observed_transition_similarity(left, candidate, adjacency)
+        right_score = _observed_transition_similarity(candidate, right, adjacency)
+        if left_score <= 0 or right_score <= 0:
+            continue
+        bottleneck = min(left_score, right_score)
+        average = (left_score + right_score) / 2
+        scored_candidates.append(
+            (
+                (bottleneck, average, max(left_score, right_score)),
+                position,
+                candidate,
+                left_score,
+                right_score,
+            )
+        )
+
+    scored_candidates.sort(key=lambda item: item[0], reverse=True)
+    resolver_cache: Dict[Tuple[str, str], Optional[Dict]] = {}
+    _resolve_candidates_batch(
+        scored_candidates[: max(limit * 4, 16)],
+        resolver_cache,
+        spotify_resolver,
+    )
+
+    observed_current_left = _observed_transition_similarity(left, current, adjacency)
+    observed_current_right = _observed_transition_similarity(current, right, adjacency)
+    current_left = (
+        max(0.0, min(1.0, float(current_left_similarity)))
+        if current_left_similarity is not None
+        else observed_current_left
+    )
+    current_right = (
+        max(0.0, min(1.0, float(current_right_similarity)))
+        if current_right_similarity is not None
+        else observed_current_right
+    )
+    current_floor = min(current_left, current_right)
+    alternatives = []
+
+    for _, _, candidate, left_score, right_score in scored_candidates:
+        spotify_track = resolver_cache.get(track_key(candidate))
+        spotify_track_id = _spotify_id(spotify_track)
+        if not spotify_track_id or spotify_track_id in used_spotify_ids:
+            continue
+
+        bottleneck = min(left_score, right_score)
+        formatted = format_track(
+            spotify_track,
+            position,
+            "bridge",
+            transition_similarity=round(left_score, 4),
+        )
+        alternatives.append({
+            "track": formatted,
+            "left_similarity": round(left_score, 4),
+            "right_similarity": round(right_score, 4),
+            "bottleneck_similarity": round(bottleneck, 4),
+            "average_similarity": round((left_score + right_score) / 2, 4),
+            "improvement": round(bottleneck - current_floor, 4),
+        })
+        used_spotify_ids.add(spotify_track_id)
+        if len(alternatives) >= limit:
+            break
+
+    return {
+        "position": position,
+        "left_track": format_track(
+            left["_spotify"],
+            position - 1,
+            "start" if position - 1 == 0 else "bridge",
+        ),
+        "current_track": format_track(
+            current["_spotify"],
+            position,
+            "bridge",
+            transition_similarity=round(current_left, 4),
+        ),
+        "right_track": format_track(
+            right["_spotify"],
+            position + 1,
+            "end" if position + 1 == len(route) - 1 else "bridge",
+            transition_similarity=round(current_right, 4),
+        ),
+        "current_bottleneck": round(current_floor, 4),
+        "alternatives": alternatives,
     }

@@ -309,6 +309,14 @@ class FrogPlaylistRequest(BaseModel):
     track_count: int = 20
 
 
+class FrogAlternativesRequest(BaseModel):
+    track_ids: List[str]
+    position: int
+    limit: int = 8
+    current_left_similarity: Optional[float] = None
+    current_right_similarity: Optional[float] = None
+
+
 @app.post("/api/recommendations/frog")
 def recommendations_frog(request: FrogPlaylistRequest):
     """
@@ -380,6 +388,28 @@ def recommendations_frog_stream(request: FrogPlaylistRequest):
             "Connection": "keep-alive",
         }
     )
+
+
+@app.post("/api/recommendations/frog/alternatives")
+def recommendations_frog_alternatives(request: FrogAlternativesRequest):
+    """Find nearby songs that can replace one bridge without breaking its neighbors."""
+    from .services.frog_playlist import get_frog_alternatives
+
+    if len(request.track_ids) < 3 or len(request.track_ids) > 50:
+        raise HTTPException(status_code=400, detail="Route must contain 3 to 50 tracks")
+    if len(set(request.track_ids)) != len(request.track_ids):
+        raise HTTPException(status_code=400, detail="Route tracks must be distinct")
+
+    try:
+        return get_frog_alternatives(
+            request.track_ids,
+            request.position,
+            request.limit,
+            current_left_similarity=request.current_left_similarity,
+            current_right_similarity=request.current_right_similarity,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
 
 
 @app.get("/api/tracks/search")
