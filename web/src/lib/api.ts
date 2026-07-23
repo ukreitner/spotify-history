@@ -337,6 +337,8 @@ export interface FrogPlaylistResult {
   spine_length?: number;
   weakest_transition?: number;
   average_transition?: number;
+  meets_smoothness_target?: boolean;
+  quality_warning?: string | null;
   success: boolean;
   error?: string;
 }
@@ -359,6 +361,11 @@ export interface FrogProgressEvent {
   end_track?: string;
   neighborhood_1hop?: number;
   neighborhood_2hop?: number;
+  built_length?: number;
+  target_length?: number;
+  batch?: number;
+  elapsed_seconds?: number;
+  weakest_transition?: number;
 }
 
 export interface FrogResultEvent {
@@ -370,6 +377,8 @@ export interface FrogResultEvent {
   spine_length?: number;
   weakest_transition?: number;
   average_transition?: number;
+  meets_smoothness_target?: boolean;
+  quality_warning?: string | null;
   success: boolean;
 }
 
@@ -387,6 +396,20 @@ export const generateFrogPlaylistStreaming = (
   onError: (event: FrogErrorEvent) => void,
 ): (() => void) => {
   const controller = new AbortController();
+  let finished = false;
+  let timedOut = false;
+
+  const reportError = (error: string) => {
+    if (finished) return;
+    finished = true;
+    onError({ type: 'error', error });
+  };
+
+  const timeout = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+    reportError('Frog Mode stopped after 100 seconds. Try again or choose closer endpoints.');
+  }, 100_000);
 
   fetch(`${API_BASE_URL}/recommendations/frog/stream`, {
     method: 'POST',
@@ -395,6 +418,9 @@ export const generateFrogPlaylistStreaming = (
     signal: controller.signal,
   })
     .then(async (response) => {
+      if (!response.ok) {
+        throw new Error(`Frog Mode request failed (${response.status})`);
+      }
       const reader = response.body?.getReader();
       if (!reader) throw new Error('No response body');
 
@@ -419,9 +445,11 @@ export const generateFrogPlaylistStreaming = (
               if (event.type === 'progress') {
                 onProgress(event);
               } else if (event.type === 'result') {
+                if (finished) continue;
+                finished = true;
                 onResult(event);
               } else if (event.type === 'error') {
-                onError(event);
+                reportError(event.error);
               }
             } catch {
               // Ignore parse errors
@@ -429,13 +457,24 @@ export const generateFrogPlaylistStreaming = (
           }
         }
       }
+
+      if (!finished) {
+        reportError('Frog Mode ended before returning a route.');
+      }
     })
     .catch((err) => {
-      if (err.name !== 'AbortError') {
-        onError({ type: 'error', error: err.message || 'Stream error' });
+      if (err.name !== 'AbortError' || timedOut) {
+        reportError(err.message || 'Stream error');
       }
+    })
+    .finally(() => {
+      window.clearTimeout(timeout);
     });
 
   // Return cancel function
-  return () => controller.abort();
+  return () => {
+    window.clearTimeout(timeout);
+    finished = true;
+    controller.abort();
+  };
 };

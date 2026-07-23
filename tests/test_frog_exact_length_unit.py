@@ -1,8 +1,13 @@
 """Deterministic regression tests for Frog Mode's exact-length route builder."""
 
 import unittest
+from unittest.mock import patch
 
-from api.services.frog_playlist import expand_path_to_exact_length, track_key
+from api.services.frog_playlist import (
+    astar_find_path_streaming,
+    expand_path_to_exact_length,
+    track_key,
+)
 
 
 def node(name, match=1.0):
@@ -114,11 +119,11 @@ class FrogExactLengthTests(unittest.TestCase):
         self.assertEqual(29, len(quality["transition_scores"]))
         self.assertEqual(0.95, quality["weakest_transition"])
 
-    def test_rejects_a_route_below_the_smoothness_floor(self):
+    def test_returns_best_exact_route_below_the_smoothness_target(self):
         start = {**self.nodes["A"], "_spotify": self.resolve("Artist A", "Track A")}
         end = {
             **self.nodes["Z"],
-            "match": 0.4,
+            "match": 0.04,
             "_spotify": self.resolve("Artist Z", "Track Z"),
         }
 
@@ -133,9 +138,95 @@ class FrogExactLengthTests(unittest.TestCase):
             similarity_fetcher=sparse_fetch,
         )
 
+        self.assertIsNotNone(route)
+        self.assertEqual(2, len(route))
+        self.assertEqual(0.04, details["weakest_transition"])
+        self.assertFalse(details["meets_smoothness_target"])
+        self.assertIn("below the 12% smoothness target", details["quality_warning"])
+
+    def test_fifty_song_request_grows_in_batches_with_progress(self):
+        names = [f"N{index:02d}" for index in range(50)]
+        nodes = {name: node(name) for name in names}
+        graph = {
+            track_key(left): [
+                {**right, "match": 0.93}
+                for right in nodes.values()
+                if track_key(right) != track_key(left)
+            ]
+            for left in nodes.values()
+        }
+        fetch_calls = []
+        progress = []
+
+        def fetch(tracks, limit=100, max_workers=20):
+            del limit, max_workers
+            fetch_calls.append(list(tracks))
+            return {
+                pair: graph[track_key({"artist": pair[0], "name": pair[1]})]
+                for pair in tracks
+            }
+
+        start = {**nodes[names[0]], "_spotify": self.resolve("Artist N00", "Track N00")}
+        end = {**nodes[names[-1]], "_spotify": self.resolve("Artist N49", "Track N49")}
+        route, quality = expand_path_to_exact_length(
+            [start, end],
+            50,
+            spotify_resolver=self.resolve,
+            similarity_fetcher=fetch,
+            progress_callback=progress.append,
+        )
+
+        self.assertIsNotNone(route)
+        self.assertEqual(50, len(route))
+        self.assertEqual(50, len({item["_spotify"]["id"] for item in route}))
+        self.assertEqual(49, len(quality["transition_scores"]))
+        # Growth is batched: substantially fewer Last.fm rounds than the 48
+        # one-track-at-a-time requests this route previously required.
+        self.assertLessEqual(len(fetch_calls), 14)
+        self.assertGreaterEqual(len(progress), 6)
+        self.assertEqual(50, progress[-1]["built_length"])
+        self.assertEqual(50, progress[-1]["target_length"])
+
+    def test_expansion_deadline_returns_partial_length(self):
+        start = {**self.nodes["A"], "_spotify": self.resolve("Artist A", "Track A")}
+        end = {**self.nodes["Z"], "_spotify": self.resolve("Artist Z", "Track Z")}
+
+        route, details = expand_path_to_exact_length(
+            [start, end],
+            5,
+            spotify_resolver=self.resolve,
+            similarity_fetcher=self.fetch,
+            max_seconds=0,
+        )
+
         self.assertIsNone(route)
-        self.assertEqual(0.4, details["weakest_transition"])
-        self.assertIn("smoothness floor", details["error"])
+        self.assertTrue(details["timed_out"])
+        self.assertEqual(2, details["built_length"])
+
+    def test_bidirectional_search_meets_on_discovered_frontier(self):
+        start = node("A")
+        middle = node("M", match=0.8)
+        end = node("Z")
+        calls = []
+
+        def fetch(tracks, limit=30, max_workers=20):
+            del limit, max_workers
+            calls.append(list(tracks))
+            return {
+                (start["artist"], start["name"]): [middle],
+                (end["artist"], end["name"]): [middle],
+            }
+
+        with patch("api.services.frog_playlist.get_similar_tracks_batch", fetch):
+            events = list(astar_find_path_streaming(start, end))
+
+        result = next(event for event in events if event["type"] == "result")
+        self.assertEqual(
+            [track_key(start), track_key(middle), track_key(end)],
+            [track_key(item) for item in result["path"]],
+        )
+        self.assertEqual(1, result["iterations"])
+        self.assertEqual(1, len(calls))
 
 
 if __name__ == "__main__":

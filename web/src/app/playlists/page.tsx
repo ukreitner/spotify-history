@@ -91,17 +91,27 @@ export default function PlaylistsPage() {
         setFrogProgress(progress);
       },
       (result) => {
+        cancelFrogRef.current = null;
         setFrogLoading(false);
         setFrogProgress(null);
         setFrogResult(result);
       },
       (error) => {
+        cancelFrogRef.current = null;
         setFrogLoading(false);
         setFrogProgress(null);
         setFrogError(error.error);
       }
     );
   }, [startTrack, endTrack, frogTrackCount]);
+
+  const handleCancelFrog = useCallback(() => {
+    cancelFrogRef.current?.();
+    cancelFrogRef.current = null;
+    setFrogLoading(false);
+    setFrogProgress(null);
+    setFrogError('Route search cancelled.');
+  }, []);
 
   const createMutation = useMutation({
     mutationFn: ({ name, trackIds }: { name: string; trackIds: string[] }) =>
@@ -544,6 +554,7 @@ export default function PlaylistsPage() {
                     {frogProgress.message || (
                       frogProgress.phase === 'neighborhood' ? 'Building neighborhood...' :
                       frogProgress.phase === 'search' ? 'Searching...' :
+                      frogProgress.phase === 'expanding' ? 'Building the exact-length route...' :
                       frogProgress.phase === 'resolving' ? 'Resolving to Spotify...' :
                       'Initializing...'
                     )}
@@ -620,6 +631,41 @@ export default function PlaylistsPage() {
                       )}
                     </div>
                   )}
+
+                  {/* Exact-length route growth */}
+                  {frogProgress.phase === 'expanding' && frogProgress.built_length !== undefined && (
+                    <div className="space-y-2">
+                      <div className="flex justify-between text-xs text-[var(--text-muted)]">
+                        <span>
+                          {frogProgress.built_length} / {frogProgress.target_length || frogTrackCount} tracks
+                        </span>
+                        <span>
+                          {frogProgress.elapsed_seconds !== undefined
+                            ? `${frogProgress.elapsed_seconds.toFixed(1)}s`
+                            : ''}
+                        </span>
+                      </div>
+                      <div className="h-2 bg-[var(--bg-secondary)] rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-gradient-to-r from-[var(--accent-primary)] to-green-400 transition-all duration-300"
+                          style={{
+                            width: `${Math.min(
+                              100,
+                              (frogProgress.built_length / (frogProgress.target_length || frogTrackCount)) * 100
+                            )}%`,
+                          }}
+                        />
+                      </div>
+                      {frogProgress.weakest_transition !== undefined && (
+                        <div className="text-xs text-[var(--text-muted)]">
+                          Weakest hop so far:{' '}
+                          <span className="text-[var(--text-primary)]">
+                            {(frogProgress.weakest_transition * 100).toFixed(0)}%
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               ) : (
                 <>
@@ -627,7 +673,8 @@ export default function PlaylistsPage() {
                   <p className="text-xs text-[var(--text-muted)]">
                     Frog Mode finds a short route spine, then subdivides its weakest
                     jumps until it reaches your exact song count. Every inserted song
-                    must be similar to both of its neighbors.
+                    must be similar to both of its neighbors. If the endpoints force a
+                    wider hop, it returns the best exact-length route with a warning.
                   </p>
                 </>
               )}
@@ -635,20 +682,30 @@ export default function PlaylistsPage() {
           )}
 
           {/* Generate Button */}
-          <button
-            onClick={handleGenerate}
-            disabled={!canGenerate || isGenerating}
-            className="w-full btn-primary py-3 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-          >
-            {isGenerating ? (
-              <>
-                <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                {mode === 'frog' ? 'Finding path...' : 'Generating...'}
-              </>
-            ) : (
-              mode === 'frog' ? 'Find Path' : 'Generate Playlist'
-            )}
-          </button>
+          {mode === 'frog' && frogLoading ? (
+            <button
+              onClick={handleCancelFrog}
+              className="w-full py-3 rounded-lg border border-red-400/40 bg-red-500/10 text-red-300 hover:bg-red-500/20 transition-colors flex items-center justify-center gap-2"
+            >
+              <div className="w-4 h-4 border-2 border-red-200/30 border-t-red-200 rounded-full animate-spin" />
+              Cancel route search
+            </button>
+          ) : (
+            <button
+              onClick={handleGenerate}
+              disabled={!canGenerate || isGenerating}
+              className="w-full btn-primary py-3 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+            >
+              {isGenerating ? (
+                <>
+                  <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  Generating...
+                </>
+              ) : (
+                mode === 'frog' ? 'Find Path' : 'Generate Playlist'
+              )}
+            </button>
+          )}
 
           {hasError && (
             <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
@@ -761,7 +818,7 @@ export default function PlaylistsPage() {
                       {frogResult.weakest_transition !== undefined && (
                         <span>
                           {' '}· weakest hop {(frogResult.weakest_transition * 100).toFixed(0)}%
-                          {' '}· average {(frogResult.average_transition! * 100).toFixed(0)}%
+                          {' '}similarity signal · average {(frogResult.average_transition! * 100).toFixed(0)}%
                         </span>
                       )}
                     </p>
@@ -785,6 +842,12 @@ export default function PlaylistsPage() {
                 {createMutation.isSuccess && (
                   <div className="mb-4 p-3 rounded-lg bg-green-500/10 border border-green-500/20 text-green-400 text-sm">
                     Playlist created successfully!
+                  </div>
+                )}
+
+                {frogResult.quality_warning && (
+                  <div className="mb-4 p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 text-sm">
+                    {frogResult.quality_warning}
                   </div>
                 )}
               </div>
@@ -811,7 +874,7 @@ export default function PlaylistsPage() {
                         subtitle={
                           track.transition_similarity == null
                             ? track.role
-                            : `${track.role} · ${(track.transition_similarity * 100).toFixed(0)}% similar to previous`
+                            : `${track.role} · ${(track.transition_similarity * 100).toFixed(0)}% Last.fm similarity signal`
                         }
                         index={i}
                       />

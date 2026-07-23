@@ -6,15 +6,21 @@ using A* pathfinding over Last.fm's track similarity graph.
 """
 
 import heapq
+import queue
 import re
+import time
 import unicodedata
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from typing import Callable, List, Dict, Optional, Set, Tuple
 from ..lastfm_client import get_similar_tracks, get_similar_tracks_batch
 from ..spotify_client import search_tracks_advanced, get_tracks_bulk
 
-MIN_FROG_TRANSITION = 0.70
+# Last.fm's ``match`` value is a ranking signal, not a probability. Real,
+# musically tight indie-folk/pop transitions commonly sit around 0.12-0.30.
+# Values below this floor still return as best-effort routes with a warning.
+MIN_FROG_TRANSITION = 0.12
 
 
 def compute_heuristic(
@@ -386,6 +392,41 @@ def _broaden_candidate_graph(
     _adjacency_for(candidates, cache, similarity_fetcher, limit)
 
 
+def _resolve_candidates_batch(
+    insertions: List[Tuple[Tuple[float, ...], int, Dict, float, float]],
+    resolver_cache: Dict[Tuple[str, str], Optional[Dict]],
+    spotify_resolver: Callable[[str, str], Optional[Dict]],
+    max_workers: int = 8,
+) -> None:
+    """Resolve candidate tracks on Spotify concurrently and cache failures."""
+    candidates: Dict[Tuple[str, str], Dict] = {}
+    for _, _, candidate, _, _ in insertions:
+        key = track_key(candidate)
+        if key not in resolver_cache:
+            candidates[key] = candidate
+
+    if not candidates:
+        return
+
+    def resolve_one(item):
+        key, candidate = item
+        return key, spotify_resolver(candidate["artist"], candidate["name"])
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(candidates))) as executor:
+        futures = [executor.submit(resolve_one, item) for item in candidates.items()]
+        for future in as_completed(futures):
+            try:
+                key, spotify_track = future.result()
+                resolver_cache[key] = spotify_track
+            except Exception:
+                # A failed Spotify lookup makes this candidate unusable, but
+                # should not abort the whole route.
+                continue
+
+    for key in candidates:
+        resolver_cache.setdefault(key, None)
+
+
 def expand_path_to_exact_length(
     path: List[Dict],
     target_length: int,
@@ -393,6 +434,8 @@ def expand_path_to_exact_length(
     spotify_resolver: Callable[[str, str], Optional[Dict]] = resolve_to_spotify,
     similarity_fetcher: Callable = get_similar_tracks_batch,
     similarity_limit: int = 100,
+    max_seconds: float = 45.0,
+    progress_callback: Optional[Callable[[Dict], None]] = None,
 ) -> Tuple[Optional[List[Dict]], Dict]:
     """
     Grow a valid graph path to exactly ``target_length`` distinct Spotify songs.
@@ -404,6 +447,7 @@ def expand_path_to_exact_length(
     if target_length < 2:
         return None, {"error": "The requested route must contain at least two songs."}
 
+    started_at = time.monotonic()
     route = [dict(node) for node in path]
     adjacency: Dict[Tuple[str, str], Dict[Tuple[str, str], Tuple[Dict, float]]] = {}
     resolver_cache: Dict[Tuple[str, str], Optional[Dict]] = {}
@@ -436,115 +480,167 @@ def expand_path_to_exact_length(
         _, _, remove_index = max(removals)
         route.pop(remove_index)
 
-    # Artist diversity remains a ranking tie-breaker, not a hard constraint.
-    # A cap can force an objectively worse jump, which violates Frog Mode's
-    # primary promise that every transition should be tiny.
-    base_route = [dict(node) for node in route]
-    initial_artist_limit = target_length
-    maximum_artist_limit = initial_artist_limit
-    best_quality: Optional[Dict] = None
-    longest_attempt = len(base_route)
+    used_keys = {track_key(node) for node in route}
+    used_spotify_ids = {
+        spotify_id
+        for spotify_id in (_spotify_id(node.get("_spotify")) for node in route)
+        if spotify_id
+    }
+    batch_number = 0
 
-    for artist_limit in range(initial_artist_limit, maximum_artist_limit + 1):
-        route = [dict(node) for node in base_route]
-        used_keys = {track_key(node) for node in route}
-        used_spotify_ids = {
-            spotify_id
-            for spotify_id in (_spotify_id(node.get("_spotify")) for node in route)
-            if spotify_id
-        }
-        build_failed = False
+    while len(route) < target_length:
+        elapsed = time.monotonic() - started_at
+        if elapsed >= max_seconds:
+            return None, {
+                "built_length": len(route),
+                "timed_out": True,
+                "error": (
+                    f"Stopped after {max_seconds:.0f} seconds with {len(route)} of "
+                    f"{target_length} tracks. Try again—the similarity cache will "
+                    "make the next run faster."
+                ),
+            }
 
-        while len(route) < target_length:
-            selected = None
-            for discovery_round in range(3):
-                insertions = _candidate_insertions(
-                    route,
-                    adjacency,
-                    used_keys,
-                    max_per_artist=artist_limit,
-                )
-                for _, index, candidate, _, _ in insertions:
-                    key = track_key(candidate)
-                    if key not in resolver_cache:
-                        resolver_cache[key] = spotify_resolver(
-                            candidate["artist"],
-                            candidate["name"],
-                        )
-                    spotify_track = resolver_cache[key]
-                    spotify_track_id = _spotify_id(spotify_track)
-                    if not spotify_track_id or spotify_track_id in used_spotify_ids:
-                        continue
-                    selected = (index, dict(candidate), spotify_track)
-                    break
+        remaining = target_length - len(route)
+        desired_additions = min(remaining, max(1, len(route) - 1), 12)
+        selected = []
 
-                if selected is not None:
-                    break
-
-                _broaden_candidate_graph(
-                    route,
-                    adjacency,
-                    used_keys,
-                    similarity_fetcher,
-                    similarity_limit,
-                    candidates_per_endpoint=12 * (discovery_round + 1),
-                )
-
-            if selected is None:
-                longest_attempt = max(longest_attempt, len(route))
-                build_failed = True
-                break
-
-            index, candidate, spotify_track = selected
-            candidate["_spotify"] = spotify_track
-            route.insert(index + 1, candidate)
-            used_keys.add(track_key(candidate))
-            used_spotify_ids.add(spotify_track["id"])
-            _adjacency_for(
-                [candidate],
+        for discovery_round in range(3):
+            insertions = _candidate_insertions(
+                route,
                 adjacency,
-                similarity_fetcher,
-                similarity_limit,
+                used_keys,
+                max_per_artist=None,
             )
 
-        if build_failed:
-            continue
+            # Resolve a small set of strong alternatives for each edge. This
+            # keeps recommendation quality while avoiding one serial Spotify
+            # request per inserted song.
+            candidate_pool = []
+            options_per_edge: Counter = Counter()
+            pooled_keys: Set[Tuple[str, str]] = set()
+            max_pool_size = max(12, desired_additions * 3)
+            for insertion in insertions:
+                edge_index = insertion[1]
+                candidate_key = track_key(insertion[2])
+                if (
+                    options_per_edge[edge_index] >= 3
+                    or candidate_key in pooled_keys
+                ):
+                    continue
+                candidate_pool.append(insertion)
+                options_per_edge[edge_index] += 1
+                pooled_keys.add(candidate_key)
+                if len(candidate_pool) >= max_pool_size:
+                    break
+
+            _resolve_candidates_batch(
+                candidate_pool,
+                resolver_cache,
+                spotify_resolver,
+            )
+
+            selected_edges: Set[int] = set()
+            selected_keys: Set[Tuple[str, str]] = set()
+            selected_spotify_ids: Set[str] = set()
+            for rank, edge_index, candidate, left_score, right_score in candidate_pool:
+                key = track_key(candidate)
+                spotify_track = resolver_cache.get(key)
+                spotify_track_id = _spotify_id(spotify_track)
+                if (
+                    edge_index in selected_edges
+                    or key in selected_keys
+                    or not spotify_track_id
+                    or spotify_track_id in used_spotify_ids
+                    or spotify_track_id in selected_spotify_ids
+                ):
+                    continue
+                selected.append(
+                    (rank, edge_index, dict(candidate), spotify_track, left_score, right_score)
+                )
+                selected_edges.add(edge_index)
+                selected_keys.add(key)
+                selected_spotify_ids.add(spotify_track_id)
+                if len(selected) >= desired_additions:
+                    break
+
+            if selected:
+                break
+
+            _broaden_candidate_graph(
+                route,
+                adjacency,
+                used_keys,
+                similarity_fetcher,
+                similarity_limit,
+                candidates_per_endpoint=12 * (discovery_round + 1),
+            )
+
+        if not selected:
+            return None, {
+                "error": (
+                    f"Could not find enough distinct Spotify tracks to complete "
+                    f"this {target_length}-song route."
+                ),
+                "built_length": len(route),
+            }
+
+        new_nodes = []
+        for _, edge_index, candidate, spotify_track, _, _ in sorted(
+            selected,
+            key=lambda item: item[1],
+            reverse=True,
+        ):
+            candidate["_spotify"] = spotify_track
+            route.insert(edge_index + 1, candidate)
+            used_keys.add(track_key(candidate))
+            used_spotify_ids.add(spotify_track["id"])
+            new_nodes.append(candidate)
+
+        # All newly inserted nodes are fetched in one parallel Last.fm round.
+        _adjacency_for(new_nodes, adjacency, similarity_fetcher, similarity_limit)
+        batch_number += 1
 
         transition_scores = [
             _transition_similarity(route[index], route[index + 1], adjacency)
             for index in range(len(route) - 1)
         ]
-        metrics = {
-            "weakest_transition": round(min(transition_scores, default=1.0), 4),
-            "average_transition": round(
-                sum(transition_scores) / len(transition_scores),
-                4,
-            ) if transition_scores else 1.0,
-            "transition_scores": [round(score, 4) for score in transition_scores],
-            "max_per_artist": artist_limit,
-        }
-        if best_quality is None or metrics["weakest_transition"] > best_quality["weakest_transition"]:
-            best_quality = metrics
-        if metrics["weakest_transition"] >= MIN_FROG_TRANSITION:
-            return route, metrics
+        weakest_so_far = min(transition_scores, default=1.0)
+        if progress_callback:
+            progress_callback({
+                "type": "progress",
+                "phase": "expanding",
+                "message": f"Built {len(route)} of {target_length} tracks",
+                "built_length": len(route),
+                "target_length": target_length,
+                "batch": batch_number,
+                "elapsed_seconds": round(time.monotonic() - started_at, 1),
+                "weakest_transition": round(weakest_so_far, 4),
+            })
 
-    if best_quality is not None:
-        return None, {
-            **best_quality,
-            "built_length": target_length,
-            "error": (
-                "A route of the requested length was found, but at least one "
-                f"jump scored below the {MIN_FROG_TRANSITION:.0%} smoothness floor. "
-                "Try closer endpoints."
-            ),
-        }
-    return None, {
-        "error": (
-            f"Could not build a smooth {target_length}-song route with distinct "
-            "Spotify tracks. Try closer endpoints or a shorter route."
-        ),
-        "built_length": longest_attempt,
+    transition_scores = [
+        _transition_similarity(route[index], route[index + 1], adjacency)
+        for index in range(len(route) - 1)
+    ]
+    metrics = {
+        "weakest_transition": round(min(transition_scores, default=1.0), 4),
+        "average_transition": round(
+            sum(transition_scores) / len(transition_scores),
+            4,
+        ) if transition_scores else 1.0,
+        "transition_scores": [round(score, 4) for score in transition_scores],
     }
+    metrics["meets_smoothness_target"] = (
+        metrics["weakest_transition"] >= MIN_FROG_TRANSITION
+    )
+    if not metrics["meets_smoothness_target"]:
+        metrics["quality_warning"] = (
+            f"Best route found; its weakest hop is "
+            f"{metrics['weakest_transition']:.0%}, below the "
+            f"{MIN_FROG_TRANSITION:.0%} smoothness target."
+        )
+
+    return route, metrics
 
 
 def resolve_path_to_spotify(path: List[Dict]) -> List[Dict]:
@@ -637,6 +733,8 @@ def _build_exact_result(
     start_spotify: Dict,
     end_spotify: Dict,
     track_count: int,
+    progress_callback: Optional[Callable[[Dict], None]] = None,
+    max_seconds: float = 45.0,
 ) -> Dict:
     """Resolve, expand, score, and format an exact-length Frog route."""
     spine_length = len(path)
@@ -651,7 +749,12 @@ def _build_exact_result(
             "error": error or "Could not resolve the route skeleton on Spotify.",
         }
 
-    exact_path, quality = expand_path_to_exact_length(spine, track_count)
+    exact_path, quality = expand_path_to_exact_length(
+        spine,
+        track_count,
+        progress_callback=progress_callback,
+        max_seconds=max_seconds,
+    )
     if not exact_path:
         return {
             "tracks": [],
@@ -660,6 +763,7 @@ def _build_exact_result(
             "requested_length": track_count,
             "spine_length": spine_length,
             "success": False,
+            "timed_out": quality.get("timed_out", False),
             "error": quality.get("error", "Could not build the requested route."),
         }
 
@@ -685,6 +789,8 @@ def _build_exact_result(
         "spine_length": spine_length,
         "weakest_transition": quality["weakest_transition"],
         "average_transition": quality["average_transition"],
+        "meets_smoothness_target": quality["meets_smoothness_target"],
+        "quality_warning": quality.get("quality_warning"),
         "success": len(spotify_tracks) == track_count,
     }
 
@@ -745,8 +851,12 @@ def generate_frog_playlist(
             "error": "Missing artist or track name",
         }
 
-    # Find path using A*
-    path = astar_find_path(start, end)
+    # Use the same bounded, deduplicated search as the streaming endpoint so
+    # API clients do not fall back to the old one-request-at-a-time traversal.
+    path = None
+    for event in astar_find_path_streaming(start, end):
+        if event.get("type") == "result":
+            path = event.get("path")
 
     if not path:
         return {
@@ -848,7 +958,39 @@ def generate_frog_playlist_streaming(
         ),
     }
 
-    result = _build_exact_result(path, start_spotify, end_spotify, track_count)
+    expansion_events: queue.Queue = queue.Queue()
+    expansion_budget = 35.0 if track_count <= 30 else 50.0
+
+    # Route expansion performs blocking Spotify and Last.fm calls. Run it in a
+    # worker so the SSE response can continue to report real batch progress.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            _build_exact_result,
+            path,
+            start_spotify,
+            end_spotify,
+            track_count,
+            expansion_events.put,
+            expansion_budget,
+        )
+        last_heartbeat = time.monotonic()
+        while not future.done():
+            try:
+                yield expansion_events.get(timeout=0.75)
+                last_heartbeat = time.monotonic()
+            except queue.Empty:
+                if time.monotonic() - last_heartbeat >= 3.0:
+                    yield {
+                        "type": "progress",
+                        "phase": "expanding",
+                        "message": "Checking the smoothest available bridge tracks...",
+                    }
+                    last_heartbeat = time.monotonic()
+
+        while not expansion_events.empty():
+            yield expansion_events.get_nowait()
+        result = future.result()
+
     if not result.get("success"):
         yield {
             "type": "error",
@@ -864,7 +1006,7 @@ def astar_find_path_streaming(
     end: Dict,
     progress_callback=None,
     max_iterations: int = 500,
-    max_seconds: float = 90.0,
+    max_seconds: float = 35.0,
 ):
     """
     Bidirectional search with PARALLEL API calls for speed.
@@ -872,8 +1014,7 @@ def astar_find_path_streaming(
     Uses batch expansion to fetch similar tracks for multiple nodes at once.
     Returns best path found within time/iteration limits.
     """
-    import time
-    start_time = time.time()
+    start_time = time.monotonic()
 
     print(f"[BiA*] Starting parallel bidirectional search: {start['artist']} - {start['name']} → {end['artist']} - {end['name']}")
 
@@ -883,8 +1024,8 @@ def astar_find_path_streaming(
         "message": "Initializing bidirectional search...",
     }
 
-    start_key = (start["artist"].lower(), start["name"].lower())
-    end_key = (end["artist"].lower(), end["name"].lower())
+    start_key = track_key(start)
+    end_key = track_key(end)
 
     if start_key == end_key:
         yield {"type": "result", "path": [start], "iterations": 0}
@@ -897,11 +1038,19 @@ def astar_find_path_streaming(
     # Forward search state
     open_f = [(0, 0, start_key, start, [start])]
     visited_f: Dict[Tuple[str, str], Tuple[float, List[Dict]]] = {}  # key -> (g_score, path)
+    discovered_f: Dict[Tuple[str, str], Tuple[float, List[Dict]]] = {
+        start_key: (0.0, [start])
+    }
+    best_g_f: Dict[Tuple[str, str], float] = {start_key: 0.0}
     counter_f = 0
 
     # Backward search state
     open_b = [(0, 0, end_key, end, [end])]
     visited_b: Dict[Tuple[str, str], Tuple[float, List[Dict]]] = {}  # key -> (g_score, path)
+    discovered_b: Dict[Tuple[str, str], Tuple[float, List[Dict]]] = {
+        end_key: (0.0, [end])
+    }
+    best_g_b: Dict[Tuple[str, str], float] = {end_key: 0.0}
     counter_b = 0
 
     iterations = 0
@@ -914,13 +1063,9 @@ def astar_find_path_streaming(
         "neighborhood_2hop": 0,
     }
 
-    # Track closest approach from each side for best-effort path
-    best_forward_to_end: Optional[Tuple[float, List[Dict]]] = None  # (distance, path)
-    best_backward_to_start: Optional[Tuple[float, List[Dict]]] = None
-
     while (open_f or open_b) and iterations < max_iterations:
         # Check time limit
-        elapsed = time.time() - start_time
+        elapsed = time.monotonic() - start_time
         if elapsed > max_seconds:
             print(f"[BiA*] Time limit reached ({elapsed:.1f}s)")
             break
@@ -929,36 +1074,46 @@ def astar_find_path_streaming(
 
         # Collect nodes to expand in batch
         to_expand_f = []
+        batch_seen_f: Set[Tuple[str, str]] = set()
         while open_f and len(to_expand_f) < BATCH_SIZE:
-            _, _, key, data, path = heapq.heappop(open_f)
-            if key not in visited_f:
-                to_expand_f.append((key, data, path))
+            g, _, key, data, path = heapq.heappop(open_f)
+            if (
+                key not in visited_f
+                and key not in batch_seen_f
+                and g <= best_g_f.get(key, float("inf"))
+            ):
+                batch_seen_f.add(key)
+                to_expand_f.append((g, key, data, path))
 
         to_expand_b = []
+        batch_seen_b: Set[Tuple[str, str]] = set()
         while open_b and len(to_expand_b) < BATCH_SIZE:
-            _, _, key, data, path = heapq.heappop(open_b)
-            if key not in visited_b:
-                to_expand_b.append((key, data, path))
+            g, _, key, data, path = heapq.heappop(open_b)
+            if (
+                key not in visited_b
+                and key not in batch_seen_b
+                and g <= best_g_b.get(key, float("inf"))
+            ):
+                batch_seen_b.add(key)
+                to_expand_b.append((g, key, data, path))
 
         if not to_expand_f and not to_expand_b:
             break
 
         # Mark visited and check for meeting point BEFORE fetching neighbors
-        for key, data, path in to_expand_f:
-            g = sum(1 - t.get("match", 0) for t in path[1:]) if len(path) > 1 else 0
+        for g, key, data, path in to_expand_f:
             visited_f[key] = (g, path)
-            if key in visited_b:
-                g_b, path_b = visited_b[key]
+            if key in discovered_b:
+                _, path_b = discovered_b[key]
                 complete_path = path[:-1] + list(reversed(path_b))
                 print(f"[BiA*] Found path in {iterations} batches!")
                 yield {"type": "result", "path": complete_path, "iterations": iterations}
                 return
 
-        for key, data, path in to_expand_b:
-            g = sum(1 - t.get("match", 0) for t in path[1:]) if len(path) > 1 else 0
+        for g, key, data, path in to_expand_b:
             visited_b[key] = (g, path)
-            if key in visited_f:
-                g_f, path_f = visited_f[key]
+            if key in discovered_f:
+                _, path_f = discovered_f[key]
                 complete_path = path_f[:-1] + list(reversed(path))
                 print(f"[BiA*] Found path in {iterations} batches!")
                 yield {"type": "result", "path": complete_path, "iterations": iterations}
@@ -968,12 +1123,12 @@ def astar_find_path_streaming(
         tracks_to_fetch = []
         track_info = {}  # Map (artist, track) -> (direction, key, data, path)
 
-        for key, data, path in to_expand_f:
+        for _, key, data, path in to_expand_f:
             t = (data["artist"], data["name"])
             tracks_to_fetch.append(t)
             track_info[t] = ("f", key, data, path)
 
-        for key, data, path in to_expand_b:
+        for _, key, data, path in to_expand_b:
             t = (data["artist"], data["name"])
             tracks_to_fetch.append(t)
             track_info[t] = ("b", key, data, path)
@@ -985,28 +1140,71 @@ def astar_find_path_streaming(
             # Process results
             for track_tuple, similar in batch_results.items():
                 direction, parent_key, parent_data, parent_path = track_info[track_tuple]
-                parent_g = sum(1 - t.get("match", 0) for t in parent_path[1:]) if len(parent_path) > 1 else 0
+                parent_g = (
+                    best_g_f[parent_key]
+                    if direction == "f"
+                    else best_g_b[parent_key]
+                )
 
                 for neighbor in similar:
-                    neighbor_key = (neighbor["artist"].lower(), neighbor["name"].lower())
+                    neighbor_key = track_key(neighbor)
+                    if not all(neighbor_key):
+                        continue
                     edge_cost = 1 - neighbor["match"]
                     new_g = parent_g + edge_cost
+                    new_path = parent_path + [neighbor]
 
                     if direction == "f":
-                        if neighbor_key not in visited_f:
-                            counter_f += 1
-                            heapq.heappush(open_f, (new_g, counter_f, neighbor_key, neighbor, parent_path + [neighbor]))
+                        if new_g >= best_g_f.get(neighbor_key, float("inf")):
+                            continue
+                        best_g_f[neighbor_key] = new_g
+                        discovered_f[neighbor_key] = (new_g, new_path)
+                        if neighbor_key in discovered_b:
+                            _, path_b = discovered_b[neighbor_key]
+                            complete_path = new_path[:-1] + list(reversed(path_b))
+                            print(f"[BiA*] Frontiers met in {iterations} batches!")
+                            yield {
+                                "type": "result",
+                                "path": complete_path,
+                                "iterations": iterations,
+                            }
+                            return
+                        counter_f += 1
+                        heapq.heappush(
+                            open_f,
+                            (new_g, counter_f, neighbor_key, neighbor, new_path),
+                        )
                     else:
-                        if neighbor_key not in visited_b:
-                            counter_b += 1
-                            heapq.heappush(open_b, (new_g, counter_b, neighbor_key, neighbor, parent_path + [neighbor]))
+                        if new_g >= best_g_b.get(neighbor_key, float("inf")):
+                            continue
+                        best_g_b[neighbor_key] = new_g
+                        discovered_b[neighbor_key] = (new_g, new_path)
+                        if neighbor_key in discovered_f:
+                            _, path_f = discovered_f[neighbor_key]
+                            complete_path = path_f[:-1] + list(reversed(new_path))
+                            print(f"[BiA*] Frontiers met in {iterations} batches!")
+                            yield {
+                                "type": "result",
+                                "path": complete_path,
+                                "iterations": iterations,
+                            }
+                            return
+                        counter_b += 1
+                        heapq.heappush(
+                            open_b,
+                            (new_g, counter_b, neighbor_key, neighbor, new_path),
+                        )
 
         # Progress update
         if progress_callback:
             total_visited = len(visited_f) + len(visited_b)
             total_queue = len(open_f) + len(open_b)
             progress_pct = min(0.9, total_visited / 100)
-            current = to_expand_f[0][1] if to_expand_f else (to_expand_b[0][1] if to_expand_b else start)
+            current = (
+                to_expand_f[0][2]
+                if to_expand_f
+                else (to_expand_b[0][2] if to_expand_b else start)
+            )
             yield progress_callback(iterations, total_visited, total_queue, 1 - progress_pct, current)
 
     # No direct path found - try to find closest meeting point
