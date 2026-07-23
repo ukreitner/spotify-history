@@ -317,6 +317,172 @@ class FrogExactLengthTests(unittest.TestCase):
         self.assertEqual(0.8, alternative["left_similarity"])
         self.assertEqual(0.7, alternative["right_similarity"])
         self.assertEqual(0.5, alternative["improvement"])
+        self.assertEqual(0.7, alternative["ranking_score"])
+        self.assertEqual(
+            {
+                "level": "high",
+                "score": 1.0,
+                "basis": (
+                    "share_of_four_possible_directional_lastfm_links_observed"
+                ),
+            },
+            alternative["confidence"],
+        )
+        self.assertTrue(alternative["evidence"]["both_neighbors_linked"])
+        self.assertTrue(alternative["evidence"]["left_edge"]["bidirectional"])
+        self.assertTrue(alternative["evidence"]["right_edge"]["bidirectional"])
+        self.assertIn(
+            "both hops were observed in both directions",
+            alternative["reason"],
+        )
+
+    def test_alternatives_rank_by_conservative_directional_evidence(self):
+        route_nodes = {name: node(name) for name in ("A", "C", "Z")}
+        asymmetric = node("B")
+        corroborated = node("D")
+        graph = {
+            track_key(route_nodes["A"]): [
+                {**route_nodes["C"], "match": 0.2},
+                {**asymmetric, "match": 0.95},
+                {**corroborated, "match": 0.65},
+            ],
+            track_key(route_nodes["C"]): [
+                {**route_nodes["A"], "match": 0.2},
+                {**route_nodes["Z"], "match": 0.3},
+            ],
+            track_key(route_nodes["Z"]): [
+                {**route_nodes["C"], "match": 0.3},
+                {**asymmetric, "match": 0.2},
+                {**corroborated, "match": 0.65},
+            ],
+            track_key(asymmetric): [
+                {**route_nodes["A"], "match": 0.2},
+                {**route_nodes["Z"], "match": 0.95},
+            ],
+            track_key(corroborated): [
+                {**route_nodes["A"], "match": 0.65},
+                {**route_nodes["Z"], "match": 0.65},
+            ],
+        }
+        spotify_tracks = {
+            name: self.resolve(f"Artist {name}", f"Track {name}")
+            for name in ("A", "C", "Z")
+        }
+
+        def fetch_tracks(track_ids):
+            by_id = {track["id"]: track for track in spotify_tracks.values()}
+            return [by_id[track_id] for track_id in track_ids]
+
+        def fetch_similar(tracks, limit=100, max_workers=20):
+            del limit, max_workers
+            return {
+                pair: graph.get(
+                    track_key({"artist": pair[0], "name": pair[1]}),
+                    [],
+                )
+                for pair in tracks
+            }
+
+        result = get_frog_alternatives(
+            [spotify_tracks[name]["id"] for name in ("A", "C", "Z")],
+            1,
+            limit=2,
+            current_left_similarity=0.9,
+            current_right_similarity=0.8,
+            track_fetcher=fetch_tracks,
+            spotify_resolver=self.resolve,
+            similarity_fetcher=fetch_similar,
+        )
+
+        alternatives = result["alternatives"]
+        self.assertEqual(
+            ["Track D", "Track B"],
+            [alternative["track"]["track"] for alternative in alternatives],
+        )
+        self.assertEqual(0.65, alternatives[0]["ranking_score"])
+        self.assertEqual(0.2, alternatives[1]["ranking_score"])
+        self.assertEqual(0.8, result["current_bottleneck"])
+        self.assertEqual(0.2, result["current_conservative_bottleneck"])
+        self.assertEqual(-0.15, alternatives[0]["improvement"])
+        self.assertEqual(0.45, alternatives[0]["conservative_improvement"])
+        # The existing display score stays backward-compatible while ranking
+        # no longer treats the asymmetric 95%/20% links as uniformly strong.
+        self.assertEqual(0.95, alternatives[1]["bottleneck_similarity"])
+        self.assertEqual(
+            0.2,
+            alternatives[1]["evidence"]["left_edge"][
+                "conservative_similarity"
+            ],
+        )
+
+    def test_alternative_confidence_reports_one_way_link_coverage(self):
+        route_nodes = {name: node(name) for name in ("A", "C", "Z")}
+        candidate = node("B")
+        graph = {
+            track_key(route_nodes["A"]): [
+                {**candidate, "match": 0.8},
+            ],
+            track_key(route_nodes["Z"]): [
+                {**candidate, "match": 0.7},
+            ],
+            track_key(candidate): [],
+        }
+        spotify_tracks = {
+            name: self.resolve(f"Artist {name}", f"Track {name}")
+            for name in ("A", "C", "Z")
+        }
+
+        def fetch_tracks(track_ids):
+            by_id = {track["id"]: track for track in spotify_tracks.values()}
+            return [by_id[track_id] for track_id in track_ids]
+
+        def fetch_similar(tracks, limit=100, max_workers=20):
+            del limit, max_workers
+            return {
+                pair: graph.get(
+                    track_key({"artist": pair[0], "name": pair[1]}),
+                    [],
+                )
+                for pair in tracks
+            }
+
+        result = get_frog_alternatives(
+            [spotify_tracks[name]["id"] for name in ("A", "C", "Z")],
+            1,
+            current_left_similarity=0.4,
+            current_right_similarity=0.5,
+            track_fetcher=fetch_tracks,
+            spotify_resolver=self.resolve,
+            similarity_fetcher=fetch_similar,
+        )
+
+        alternative = result["alternatives"][0]
+        self.assertEqual("limited", alternative["confidence"]["level"])
+        self.assertEqual(0.5, alternative["confidence"]["score"])
+        self.assertEqual(0.4, result["current_conservative_bottleneck"])
+        self.assertEqual(0.3, alternative["conservative_improvement"])
+        self.assertEqual(
+            ["left_neighbor_to_candidate"],
+            [
+                observation["direction"]
+                for observation in alternative["evidence"]["left_edge"][
+                    "observations"
+                ]
+            ],
+        )
+        self.assertEqual(
+            ["right_neighbor_to_candidate"],
+            [
+                observation["direction"]
+                for observation in alternative["evidence"]["right_edge"][
+                    "observations"
+                ]
+            ],
+        )
+        self.assertIn(
+            "each hop has one observed direction",
+            alternative["reason"],
+        )
 
 
 if __name__ == "__main__":

@@ -22,6 +22,115 @@ from ..spotify_client import search_tracks_advanced, get_tracks_bulk
 # Values below this floor still return as best-effort routes with a warning.
 MIN_FROG_TRANSITION = 0.12
 
+# The browser renders a sampled search trace, not the search engine's complete
+# working set. Keeping that distinction explicit prevents a difficult search
+# from accumulating tens of thousands of rich node/edge dictionaries in the
+# streaming generator before the final SSE result is sent.
+FROG_EXPLORATION_MAX_NODES = 600
+FROG_EXPLORATION_MAX_EDGES = 1200
+
+# Search entries retain complete paths so exact-route reconstruction remains
+# simple and reliable. Bound both unique discovered states and the live
+# frontier to keep an unusually disconnected pair from growing memory until
+# the process is killed.
+FROG_SEARCH_MAX_STATES_PER_DIRECTION = 3000
+FROG_SEARCH_MAX_FRONTIER_PER_DIRECTION = 1200
+
+# Repair only needs a broad local neighborhood, not every candidate returned
+# by three 100-track similarity lists.
+FROG_REPAIR_MAX_CANDIDATES = 64
+
+
+class _BoundedSearchFrontier:
+    """A deterministic min-priority frontier with a hard live-entry limit."""
+
+    def __init__(self, max_entries: int):
+        self.max_entries = max(1, int(max_entries))
+        self._entries: Dict[int, Tuple] = {}
+        self._key_tokens: Dict[Tuple[str, str], int] = {}
+        self._min_heap: List[Tuple[float, int]] = []
+        self._max_heap: List[Tuple[float, int, int]] = []
+
+    def __bool__(self) -> bool:
+        return bool(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def _remove(self, token: int) -> None:
+        entry = self._entries.pop(token, None)
+        if entry is not None:
+            self._key_tokens.pop(entry[2], None)
+
+    def _compact_if_needed(self) -> None:
+        # Eviction and score improvements leave lazy-deleted heap records.
+        # Rebuild at a fixed threshold so the backing heaps are bounded too.
+        heap_limit = self.max_entries * 2
+        if len(self._min_heap) >= heap_limit:
+            self._min_heap = [
+                (entry[0], token)
+                for token, entry in self._entries.items()
+            ]
+            heapq.heapify(self._min_heap)
+        if len(self._max_heap) >= heap_limit:
+            self._max_heap = [
+                (-entry[0], -entry[1], token)
+                for token, entry in self._entries.items()
+            ]
+            heapq.heapify(self._max_heap)
+
+    def _worst_token(self) -> Optional[int]:
+        while self._max_heap:
+            _, _, token = self._max_heap[0]
+            if token in self._entries:
+                return token
+            heapq.heappop(self._max_heap)
+        return None
+
+    def push(
+        self,
+        g_score: float,
+        token: int,
+        key: Tuple[str, str],
+        data: Dict,
+        path: List[Dict],
+    ) -> bool:
+        """Keep the best bounded set; return whether this entry survived."""
+        entry = (g_score, token, key, data, path)
+        previous_token = self._key_tokens.get(key)
+        if previous_token is not None:
+            previous = self._entries[previous_token]
+            if (g_score, token) >= (previous[0], previous[1]):
+                return False
+            self._remove(previous_token)
+
+        if len(self._entries) >= self.max_entries:
+            worst_token = self._worst_token()
+            if worst_token is None:
+                return False
+            worst = self._entries[worst_token]
+            if (g_score, token) >= (worst[0], worst[1]):
+                return False
+            self._remove(worst_token)
+
+        self._compact_if_needed()
+        self._entries[token] = entry
+        self._key_tokens[key] = token
+        heapq.heappush(self._min_heap, (g_score, token))
+        heapq.heappush(self._max_heap, (-g_score, -token, token))
+        return True
+
+    def pop(self) -> Tuple:
+        """Pop the best live entry, skipping lazily deleted heap records."""
+        while self._min_heap:
+            _, token = heapq.heappop(self._min_heap)
+            entry = self._entries.get(token)
+            if entry is None:
+                continue
+            self._remove(token)
+            return entry
+        raise IndexError("pop from an empty search frontier")
+
 
 def compute_heuristic(
     track_key: Tuple[str, str],
@@ -68,7 +177,7 @@ def astar_find_path(
     Returns:
         List of track dicts representing the path, or None if no path found
     """
-    print(f"[BiA*] Starting bidirectional search: {start['artist']} - {start['name']} → {end['artist']} - {end['name']}")
+    print("[BiA*] Starting bidirectional search")
 
     start_key = (start["artist"].lower(), start["name"].lower())
     end_key = (end["artist"].lower(), end["name"].lower())
@@ -235,6 +344,121 @@ def graph_node_id(track: Dict) -> str:
     return "::".join(track_key(track))
 
 
+def _exploration_node_priority(node: Dict, preferred_node_ids: Set[str]) -> Tuple:
+    """Stable retention order for a bounded Frog search trace."""
+    node_id = str(node.get("id", ""))
+    state = str(node.get("state", ""))
+    direction = str(node.get("direction", ""))
+    if direction == "route" or node.get("route_position") is not None:
+        tier = 0
+    elif state in {"start", "end"}:
+        tier = 1
+    elif state == "meeting":
+        tier = 2
+    elif node_id in preferred_node_ids and state == "expanded":
+        tier = 3
+    elif node_id in preferred_node_ids:
+        tier = 4
+    elif state == "expanded":
+        tier = 5
+    else:
+        tier = 6
+
+    route_position = node.get("route_position")
+    if not isinstance(route_position, (int, float)):
+        route_position = float("inf")
+    depth = node.get("depth")
+    if not isinstance(depth, (int, float)):
+        depth = float("inf")
+    return (tier, route_position, depth, node_id)
+
+
+def _budget_exploration_graph(
+    nodes: List[Dict],
+    edges: List[Dict],
+    *,
+    max_nodes: int = FROG_EXPLORATION_MAX_NODES,
+    max_edges: int = FROG_EXPLORATION_MAX_EDGES,
+    preferred_node_ids: Optional[Set[str]] = None,
+) -> Dict:
+    """
+    Return a deterministic, referentially valid sample of an exploration graph.
+
+    Route/end-point/meeting nodes win retention first, followed by the active
+    frontier and expanded nodes. Edges are retained only when both endpoints
+    survive, so a capped payload never contains dangling links.
+    """
+    max_nodes = max(0, int(max_nodes))
+    max_edges = max(0, int(max_edges))
+    preferred = set(preferred_node_ids or ())
+    node_map = {
+        str(node["id"]): node
+        for node in nodes
+        if isinstance(node, dict) and node.get("id")
+    }
+    edge_map = {
+        str(edge["id"]): edge
+        for edge in edges
+        if isinstance(edge, dict) and edge.get("id")
+    }
+
+    ordered_nodes = sorted(
+        node_map.values(),
+        key=lambda node: _exploration_node_priority(node, preferred),
+    )
+    retained_nodes = ordered_nodes[:max_nodes]
+    retained_node_ids = {str(node["id"]) for node in retained_nodes}
+    node_rank = {
+        str(node["id"]): index
+        for index, node in enumerate(retained_nodes)
+    }
+
+    valid_edges = [
+        edge
+        for edge in edge_map.values()
+        if str(edge.get("source", "")) in retained_node_ids
+        and str(edge.get("target", "")) in retained_node_ids
+    ]
+
+    def edge_priority(edge: Dict) -> Tuple:
+        source = str(edge.get("source", ""))
+        target = str(edge.get("target", ""))
+        kind = str(edge.get("kind", ""))
+        direction = str(edge.get("direction", ""))
+        if kind == "route" or direction == "route":
+            tier = 0
+        elif source in preferred or target in preferred:
+            tier = 1
+        else:
+            tier = 2
+        try:
+            similarity = float(edge.get("similarity", 0.0))
+        except (TypeError, ValueError):
+            similarity = 0.0
+        return (
+            tier,
+            max(node_rank[source], node_rank[target]),
+            -similarity,
+            str(edge.get("id", "")),
+        )
+
+    retained_edges = sorted(valid_edges, key=edge_priority)[:max_edges]
+    return {
+        "nodes": retained_nodes,
+        "edges": retained_edges,
+        "retained_nodes": len(retained_nodes),
+        "retained_edges": len(retained_edges),
+        "omitted_nodes": max(0, len(node_map) - len(retained_nodes)),
+        "omitted_edges": max(0, len(edge_map) - len(retained_edges)),
+        "node_limit": max_nodes,
+        "edge_limit": max_edges,
+        "truncated": (
+            len(retained_nodes) < len(node_map)
+            or len(retained_edges) < len(edge_map)
+        ),
+    }
+
+
 def _spotify_id(track: Optional[Dict]) -> Optional[str]:
     return track.get("id") if track else None
 
@@ -296,14 +520,109 @@ def _observed_transition_similarity(
     cache: Dict[Tuple[str, str], Dict[Tuple[str, str], Tuple[Dict, float]]],
 ) -> float:
     """Similarity supported by an explicit Last.fm edge in either direction."""
+    return _transition_evidence(left, right, cache)["observed_similarity"]
+
+
+def _transition_evidence(
+    left: Dict,
+    right: Dict,
+    cache: Dict[Tuple[str, str], Dict[Tuple[str, str], Tuple[Dict, float]]],
+) -> Dict:
+    """
+    Describe the directional Last.fm evidence for one transition.
+
+    Last.fm similarity lists are directional and can disagree. The observed
+    similarity preserves the existing optimistic ``max`` behavior for display,
+    while the conservative similarity uses the weaker directional observation
+    whenever both directions are present.
+    """
     left_key = track_key(left)
     right_key = track_key(right)
-    observations: List[float] = []
+    left_to_right = None
+    right_to_left = None
+
     if right_key in cache.get(left_key, {}):
-        observations.append(cache[left_key][right_key][1])
+        left_to_right = cache[left_key][right_key][1]
     if left_key in cache.get(right_key, {}):
-        observations.append(cache[right_key][left_key][1])
-    return max(observations, default=0.0)
+        right_to_left = cache[right_key][left_key][1]
+
+    observations = [
+        score
+        for score in (left_to_right, right_to_left)
+        if score is not None
+    ]
+    return {
+        "left_to_right": left_to_right,
+        "right_to_left": right_to_left,
+        "direction_count": len(observations),
+        "bidirectional": len(observations) == 2,
+        "observed_similarity": max(observations, default=0.0),
+        "conservative_similarity": min(observations, default=0.0),
+    }
+
+
+def _format_alternative_edge_evidence(
+    evidence: Dict,
+    *,
+    forward_label: str,
+    reverse_label: str,
+) -> Dict:
+    """Return compact, JSON-safe evidence without implying audio analysis."""
+    observations = []
+    if evidence["left_to_right"] is not None:
+        observations.append({
+            "direction": forward_label,
+            "similarity": round(evidence["left_to_right"], 4),
+        })
+    if evidence["right_to_left"] is not None:
+        observations.append({
+            "direction": reverse_label,
+            "similarity": round(evidence["right_to_left"], 4),
+        })
+
+    return {
+        "observations": observations,
+        "direction_count": evidence["direction_count"],
+        "bidirectional": evidence["bidirectional"],
+        "observed_similarity": round(evidence["observed_similarity"], 4),
+        "conservative_similarity": round(
+            evidence["conservative_similarity"],
+            4,
+        ),
+    }
+
+
+def _alternative_reason(
+    left_conservative: float,
+    right_conservative: float,
+    bidirectional_hops: int,
+) -> str:
+    """Explain the ranking using only explicit Last.fm graph evidence."""
+    if abs(left_conservative - right_conservative) <= 0.01:
+        limiting = "the two sides are balanced"
+        bottleneck = min(left_conservative, right_conservative)
+    elif left_conservative < right_conservative:
+        limiting = "the left hop is the limiting side"
+        bottleneck = left_conservative
+    else:
+        limiting = "the right hop is the limiting side"
+        bottleneck = right_conservative
+
+    if bidirectional_hops == 2:
+        support = "both hops were observed in both directions"
+    elif bidirectional_hops == 1:
+        support = (
+            "one hop was observed in both directions and the other in one "
+            "direction"
+        )
+    else:
+        support = "each hop has one observed direction"
+
+    return (
+        "Explicit Last.fm links connect this track to both neighbors; "
+        f"{limiting} at a conservative {round(bottleneck * 100)}%. "
+        f"Confidence reflects that {support}."
+    )
 
 
 def _candidate_insertions(
@@ -902,9 +1221,11 @@ def generate_frog_playlist(
     # Use the same bounded, deduplicated search as the streaming endpoint so
     # API clients do not fall back to the old one-request-at-a-time traversal.
     path = None
+    search_limited = False
     for event in astar_find_path_streaming(start, end):
         if event.get("type") == "result":
             path = event.get("path")
+            search_limited = bool(event.get("limited_by_budget", False))
 
     if not path:
         return {
@@ -912,7 +1233,12 @@ def generate_frog_playlist(
             "path_length": 0,
             "iterations": 0,
             "success": False,
-            "error": "No path found between tracks. They may be too different.",
+            "error": (
+                "Search reached its safe exploration limit. Try closer tracks."
+                if search_limited
+                else "No path found between tracks. They may be too different."
+            ),
+            "search_limited": search_limited,
         }
 
     return _build_exact_result(path, start_spotify, end_spotify, track_count)
@@ -990,23 +1316,76 @@ def generate_frog_playlist_streaming(
         }
 
     path = None
+    search_limited = False
     exploration_nodes: Dict[str, Dict] = {}
     exploration_edges: Dict[str, Dict] = {}
+    preferred_search_nodes = {
+        graph_node_id(start),
+        graph_node_id(end),
+    }
+    search_total_nodes = 0
+    search_total_edges = 0
     for event in astar_find_path_streaming(start, end, progress_callback):
         if event.get("type") == "result":
             path = event.get("path")
+            search_limited = bool(event.get("limited_by_budget", False))
         else:
             exploration = event.get("exploration", {})
-            for node in exploration.get("nodes", []):
-                exploration_nodes[node["id"]] = node
-            for edge in exploration.get("edges", []):
-                exploration_edges[edge["id"]] = edge
+            search_total_nodes = max(
+                search_total_nodes,
+                int(exploration.get("total_nodes", 0) or 0),
+            )
+            search_total_edges = max(
+                search_total_edges,
+                int(exploration.get("total_edges", 0) or 0),
+            )
+            focus_node_id = exploration.get("focus_node_id")
+            active_preferred = set(preferred_search_nodes)
+            if focus_node_id:
+                active_preferred.add(str(focus_node_id))
+            active_preferred.update(
+                str(node["id"])
+                for node in exploration.get("nodes", [])
+                if node.get("id")
+            )
+            bounded = _budget_exploration_graph(
+                [
+                    *exploration_nodes.values(),
+                    *exploration.get("nodes", []),
+                ],
+                [
+                    *exploration_edges.values(),
+                    *exploration.get("edges", []),
+                ],
+                preferred_node_ids=active_preferred,
+            )
+            exploration_nodes = {
+                node["id"]: node
+                for node in bounded["nodes"]
+            }
+            exploration_edges = {
+                edge["id"]: edge
+                for edge in bounded["edges"]
+            }
+            # The progress event remains a compact delta for existing clients.
+            # These fields disclose the total search size and the bounded
+            # server-side trace without forcing clients to render either one.
+            exploration["retained_nodes"] = len(exploration_nodes)
+            exploration["retained_edges"] = len(exploration_edges)
+            exploration["node_limit"] = FROG_EXPLORATION_MAX_NODES
+            exploration["edge_limit"] = FROG_EXPLORATION_MAX_EDGES
+            exploration["budget_truncated"] = bounded["truncated"]
             yield event
 
     if not path:
         yield {
             "type": "error",
-            "error": "No path found between tracks. They may be too different.",
+            "error": (
+                "Search reached its safe exploration limit. Try closer tracks."
+                if search_limited
+                else "No path found between tracks. They may be too different."
+            ),
+            "search_limited": search_limited,
         }
         return
 
@@ -1062,13 +1441,64 @@ def generate_frog_playlist_streaming(
         return
 
     route_exploration = result.get("exploration", {})
-    for node in route_exploration.get("nodes", []):
-        exploration_nodes[node["id"]] = node
-    for edge in route_exploration.get("edges", []):
-        exploration_edges[edge["id"]] = edge
+    search_node_ids = set(exploration_nodes)
+    search_edge_ids = set(exploration_edges)
+    route_node_ids = {
+        str(node["id"])
+        for node in route_exploration.get("nodes", [])
+        if node.get("id")
+    }
+    bounded = _budget_exploration_graph(
+        [
+            *exploration_nodes.values(),
+            *route_exploration.get("nodes", []),
+        ],
+        [
+            *exploration_edges.values(),
+            *route_exploration.get("edges", []),
+        ],
+        preferred_node_ids=preferred_search_nodes | route_node_ids,
+    )
+    final_node_ids = {
+        str(node["id"])
+        for node in bounded["nodes"]
+        if node.get("id")
+    }
+    final_edge_ids = {
+        str(edge["id"])
+        for edge in bounded["edges"]
+        if edge.get("id")
+    }
+    # Route nodes are prioritized when the final mixed graph is sampled, so
+    # count search IDs only after that last budget pass. Computing this before
+    # the merge understated omissions whenever route nodes displaced search
+    # nodes at the cap.
+    retained_search_nodes = len(search_node_ids & final_node_ids)
+    retained_search_edges = len(search_edge_ids & final_edge_ids)
     result["exploration"] = {
-        "nodes": list(exploration_nodes.values()),
-        "edges": list(exploration_edges.values()),
+        **bounded,
+        # Totals deliberately describe the search. The exact-length route is
+        # reported separately because route expansion can add songs that were
+        # never part of the original bidirectional frontier.
+        "total_nodes": max(search_total_nodes, retained_search_nodes),
+        "total_edges": max(search_total_edges, retained_search_edges),
+        "totals_scope": "search",
+        "route_nodes": len(route_exploration.get("nodes", [])),
+        "route_edges": len(route_exploration.get("edges", [])),
+        "retained_search_nodes": retained_search_nodes,
+        "retained_search_edges": retained_search_edges,
+        "omitted_search_nodes": max(
+            0,
+            search_total_nodes - retained_search_nodes,
+        ),
+        "omitted_search_edges": max(
+            0,
+            search_total_edges - retained_search_edges,
+        ),
+        "sampled": (
+            search_total_nodes > retained_search_nodes
+            or search_total_edges > retained_search_edges
+        ),
     }
 
     yield {"type": "result", **result}
@@ -1089,7 +1519,7 @@ def astar_find_path_streaming(
     """
     start_time = time.monotonic()
 
-    print(f"[BiA*] Starting parallel bidirectional search: {start['artist']} - {start['name']} → {end['artist']} - {end['name']}")
+    print("[BiA*] Starting parallel bidirectional search")
 
     yield {
         "type": "progress",
@@ -1109,7 +1539,10 @@ def astar_find_path_streaming(
     BATCH_SIZE = 10  # Expand 10 nodes in parallel per side (up to 20 API calls per batch)
 
     # Forward search state
-    open_f = [(0, 0, start_key, start, [start])]
+    open_f = _BoundedSearchFrontier(
+        FROG_SEARCH_MAX_FRONTIER_PER_DIRECTION,
+    )
+    open_f.push(0.0, 0, start_key, start, [start])
     visited_f: Dict[Tuple[str, str], Tuple[float, List[Dict]]] = {}  # key -> (g_score, path)
     discovered_f: Dict[Tuple[str, str], Tuple[float, List[Dict]]] = {
         start_key: (0.0, [start])
@@ -1118,13 +1551,19 @@ def astar_find_path_streaming(
     counter_f = 0
 
     # Backward search state
-    open_b = [(0, 0, end_key, end, [end])]
+    open_b = _BoundedSearchFrontier(
+        FROG_SEARCH_MAX_FRONTIER_PER_DIRECTION,
+    )
+    open_b.push(0.0, 0, end_key, end, [end])
     visited_b: Dict[Tuple[str, str], Tuple[float, List[Dict]]] = {}  # key -> (g_score, path)
     discovered_b: Dict[Tuple[str, str], Tuple[float, List[Dict]]] = {
         end_key: (0.0, [end])
     }
     best_g_b: Dict[Tuple[str, str], float] = {end_key: 0.0}
     counter_b = 0
+    sampled_link_count = 0
+    state_budget_reached = False
+    frontier_rejections = 0
 
     iterations = 0
 
@@ -1141,6 +1580,7 @@ def astar_find_path_streaming(
             return None
         total_visited = len(visited_f) + len(visited_b)
         total_queue = len(open_f) + len(open_b)
+        total_discovered = len(set(discovered_f).union(discovered_b))
         progress_pct = min(0.9, total_visited / 100)
         return progress_callback(
             iterations,
@@ -1151,6 +1591,10 @@ def astar_find_path_streaming(
             {
                 "nodes": list(graph_nodes.values()),
                 "edges": list(graph_edges.values()),
+                "total_nodes": total_discovered,
+                "total_edges": sampled_link_count,
+                "totals_scope": "search",
+                "focus_node_id": graph_node_id(current),
             },
         )
 
@@ -1167,7 +1611,7 @@ def astar_find_path_streaming(
         to_expand_f = []
         batch_seen_f: Set[Tuple[str, str]] = set()
         while open_f and len(to_expand_f) < BATCH_SIZE:
-            g, _, key, data, path = heapq.heappop(open_f)
+            g, _, key, data, path = open_f.pop()
             if (
                 key not in visited_f
                 and key not in batch_seen_f
@@ -1179,7 +1623,7 @@ def astar_find_path_streaming(
         to_expand_b = []
         batch_seen_b: Set[Tuple[str, str]] = set()
         while open_b and len(to_expand_b) < BATCH_SIZE:
-            g, _, key, data, path = heapq.heappop(open_b)
+            g, _, key, data, path = open_b.pop()
             if (
                 key not in visited_b
                 and key not in batch_seen_b
@@ -1222,6 +1666,7 @@ def astar_find_path_streaming(
                 _, path_b = discovered_b[key]
                 complete_path = path[:-1] + list(reversed(path_b))
                 print(f"[BiA*] Found path in {iterations} batches!")
+                graph_nodes[graph_node_id(data)]["state"] = "meeting"
                 progress_event = make_progress_event(data, graph_nodes, graph_edges)
                 if progress_event:
                     yield progress_event
@@ -1234,6 +1679,7 @@ def astar_find_path_streaming(
                 _, path_f = discovered_f[key]
                 complete_path = path_f[:-1] + list(reversed(path))
                 print(f"[BiA*] Found path in {iterations} batches!")
+                graph_nodes[graph_node_id(data)]["state"] = "meeting"
                 progress_event = make_progress_event(data, graph_nodes, graph_edges)
                 if progress_event:
                     yield progress_event
@@ -1264,50 +1710,68 @@ def astar_find_path_streaming(
                 graph_direction = "forward" if direction == "f" else "backward"
                 parent_id = graph_node_id(parent_data)
                 parent_depth = len(parent_path) - 1
-                for neighbor in similar[:5]:
-                    neighbor_id = graph_node_id(neighbor)
-                    if not all(track_key(neighbor)):
-                        continue
-                    graph_nodes[neighbor_id] = {
-                        "id": neighbor_id,
-                        "artist": neighbor["artist"],
-                        "track": neighbor["name"],
-                        "direction": graph_direction,
-                        "depth": parent_depth + 1,
-                        "state": "discovered",
-                    }
-                    edge_id = f"{graph_direction}:{parent_id}>{neighbor_id}"
-                    graph_edges[edge_id] = {
-                        "id": edge_id,
-                        "source": parent_id,
-                        "target": neighbor_id,
-                        "similarity": round(float(neighbor.get("match", 0.0)), 4),
-                        "direction": graph_direction,
-                        "kind": "search",
-                    }
                 parent_g = (
                     best_g_f[parent_key]
                     if direction == "f"
                     else best_g_b[parent_key]
                 )
 
-                for neighbor in similar:
+                # Respect the declared branching limit even if a test double or
+                # upstream client returns more than requested.
+                for neighbor_index, neighbor in enumerate(similar[:SIMILAR_LIMIT]):
                     neighbor_key = track_key(neighbor)
                     if not all(neighbor_key):
                         continue
+                    neighbor_id = graph_node_id(neighbor)
+                    if neighbor_index < 5:
+                        graph_nodes[neighbor_id] = {
+                            "id": neighbor_id,
+                            "artist": neighbor["artist"],
+                            "track": neighbor["name"],
+                            "direction": graph_direction,
+                            "depth": parent_depth + 1,
+                            "state": "discovered",
+                        }
+                        edge_id = f"{graph_direction}:{parent_id}>{neighbor_id}"
+                        if edge_id not in graph_edges:
+                            # A parent is expanded at most once per direction,
+                            # so directional edge IDs are globally unique.
+                            sampled_link_count += 1
+                        graph_edges[edge_id] = {
+                            "id": edge_id,
+                            "source": parent_id,
+                            "target": neighbor_id,
+                            "similarity": round(
+                                float(neighbor.get("match", 0.0)),
+                                4,
+                            ),
+                            "direction": graph_direction,
+                            "kind": "search",
+                        }
                     edge_cost = 1 - neighbor["match"]
                     new_g = parent_g + edge_cost
                     new_path = parent_path + [neighbor]
 
                     if direction == "f":
+                        if neighbor_key in visited_f:
+                            continue
                         if new_g >= best_g_f.get(neighbor_key, float("inf")):
                             continue
-                        best_g_f[neighbor_key] = new_g
-                        discovered_f[neighbor_key] = (new_g, new_path)
+                        is_new_discovery = neighbor_key not in discovered_f
                         if neighbor_key in discovered_b:
                             _, path_b = discovered_b[neighbor_key]
                             complete_path = new_path[:-1] + list(reversed(path_b))
                             print(f"[BiA*] Frontiers met in {iterations} batches!")
+                            graph_nodes.setdefault(
+                                neighbor_id,
+                                {
+                                    "id": neighbor_id,
+                                    "artist": neighbor["artist"],
+                                    "track": neighbor["name"],
+                                    "direction": graph_direction,
+                                    "depth": parent_depth + 1,
+                                },
+                            )["state"] = "meeting"
                             progress_event = make_progress_event(
                                 neighbor,
                                 graph_nodes,
@@ -1321,20 +1785,44 @@ def astar_find_path_streaming(
                                 "iterations": iterations,
                             }
                             return
+                        if (
+                            is_new_discovery
+                            and len(discovered_f)
+                            >= FROG_SEARCH_MAX_STATES_PER_DIRECTION
+                        ):
+                            state_budget_reached = True
+                            continue
+                        best_g_f[neighbor_key] = new_g
+                        discovered_f[neighbor_key] = (new_g, new_path)
                         counter_f += 1
-                        heapq.heappush(
-                            open_f,
-                            (new_g, counter_f, neighbor_key, neighbor, new_path),
-                        )
+                        if not open_f.push(
+                            new_g,
+                            counter_f,
+                            neighbor_key,
+                            neighbor,
+                            new_path,
+                        ):
+                            frontier_rejections += 1
                     else:
+                        if neighbor_key in visited_b:
+                            continue
                         if new_g >= best_g_b.get(neighbor_key, float("inf")):
                             continue
-                        best_g_b[neighbor_key] = new_g
-                        discovered_b[neighbor_key] = (new_g, new_path)
+                        is_new_discovery = neighbor_key not in discovered_b
                         if neighbor_key in discovered_f:
                             _, path_f = discovered_f[neighbor_key]
                             complete_path = path_f[:-1] + list(reversed(new_path))
                             print(f"[BiA*] Frontiers met in {iterations} batches!")
+                            graph_nodes.setdefault(
+                                neighbor_id,
+                                {
+                                    "id": neighbor_id,
+                                    "artist": neighbor["artist"],
+                                    "track": neighbor["name"],
+                                    "direction": graph_direction,
+                                    "depth": parent_depth + 1,
+                                },
+                            )["state"] = "meeting"
                             progress_event = make_progress_event(
                                 neighbor,
                                 graph_nodes,
@@ -1348,11 +1836,24 @@ def astar_find_path_streaming(
                                 "iterations": iterations,
                             }
                             return
+                        if (
+                            is_new_discovery
+                            and len(discovered_b)
+                            >= FROG_SEARCH_MAX_STATES_PER_DIRECTION
+                        ):
+                            state_budget_reached = True
+                            continue
+                        best_g_b[neighbor_key] = new_g
+                        discovered_b[neighbor_key] = (new_g, new_path)
                         counter_b += 1
-                        heapq.heappush(
-                            open_b,
-                            (new_g, counter_b, neighbor_key, neighbor, new_path),
-                        )
+                        if not open_b.push(
+                            new_g,
+                            counter_b,
+                            neighbor_key,
+                            neighbor,
+                            new_path,
+                        ):
+                            frontier_rejections += 1
 
         # Progress update
         if progress_callback:
@@ -1368,15 +1869,16 @@ def astar_find_path_streaming(
     # No direct path found - try to find closest meeting point
     print(f"[BiA*] No direct path after {iterations} batches, checking for close approaches...")
 
-    # Find any overlap between visited sets
-    overlap = set(visited_f.keys()) & set(visited_b.keys())
+    # A time/iteration/budget stop can still use any complete connection
+    # already retained on both sides, even when one side had not expanded it.
+    overlap = set(discovered_f) & set(discovered_b)
     if overlap:
         # Find the overlap with minimum total cost
         best_meeting = None
         best_cost = float('inf')
         for key in overlap:
-            g_f, path_f = visited_f[key]
-            g_b, path_b = visited_b[key]
+            g_f, path_f = discovered_f[key]
+            g_b, path_b = discovered_b[key]
             cost = g_f + g_b
             if cost < best_cost:
                 best_cost = cost
@@ -1386,13 +1888,29 @@ def astar_find_path_streaming(
             path_f, path_b = best_meeting
             complete_path = path_f[:-1] + list(reversed(path_b))
             print(f"[BiA*] Found late meeting point! Path length: {len(complete_path)}")
-            yield {"type": "result", "path": complete_path, "iterations": iterations}
+            yield {
+                "type": "result",
+                "path": complete_path,
+                "iterations": iterations,
+                "limited_by_budget": (
+                    state_budget_reached or frontier_rejections > 0
+                ),
+            }
             return
 
     # If still no path, find closest approach and try to bridge via a popular intermediate
     # Just return None for now - user can try different tracks
     print(f"[BiA*] NO PATH FOUND - genres may be too different")
-    yield {"type": "result", "path": None, "iterations": iterations}
+    yield {
+        "type": "result",
+        "path": None,
+        "iterations": iterations,
+        "limited_by_budget": (
+            state_budget_reached or frontier_rejections > 0
+        ),
+        "retained_states": len(set(discovered_f).union(discovered_b)),
+        "frontier_rejections": frontier_rejections,
+    }
 
 
 def format_track(
@@ -1433,8 +1951,9 @@ def get_frog_alternatives(
     """
     Find Spotify replacements that fit both neighbors of one route position.
 
-    Endpoints are immutable. Candidates are ranked by their weaker adjacent
-    edge first, so a swap cannot hide one bad jump behind one excellent jump.
+    Endpoints are immutable. Candidates are ranked by the weaker directional
+    observation on their weaker adjacent edge, so a strong one-way Last.fm
+    link cannot hide either a weak reverse observation or a weak second hop.
     """
     if len(track_ids) < 3:
         raise ValueError("A Frog route needs at least three tracks.")
@@ -1486,20 +2005,33 @@ def get_frog_alternatives(
         candidate_by_key.values(),
         key=lambda node: initial_strength.get(track_key(node), 0.0),
         reverse=True,
-    )[: max(80, limit * 12)]
+    )[:FROG_REPAIR_MAX_CANDIDATES]
     _adjacency_for(candidate_nodes, adjacency, similarity_fetcher, 100)
 
     scored_candidates = []
     for candidate in candidate_nodes:
-        left_score = _observed_transition_similarity(left, candidate, adjacency)
-        right_score = _observed_transition_similarity(candidate, right, adjacency)
+        left_evidence = _transition_evidence(left, candidate, adjacency)
+        right_evidence = _transition_evidence(candidate, right, adjacency)
+        left_score = left_evidence["observed_similarity"]
+        right_score = right_evidence["observed_similarity"]
         if left_score <= 0 or right_score <= 0:
             continue
-        bottleneck = min(left_score, right_score)
-        average = (left_score + right_score) / 2
+
+        conservative_left = left_evidence["conservative_similarity"]
+        conservative_right = right_evidence["conservative_similarity"]
+        conservative_bottleneck = min(conservative_left, conservative_right)
+        confidence_score = (
+            left_evidence["direction_count"] + right_evidence["direction_count"]
+        ) / 4
         scored_candidates.append(
             (
-                (bottleneck, average, max(left_score, right_score)),
+                (
+                    conservative_bottleneck,
+                    confidence_score,
+                    (conservative_left + conservative_right) / 2,
+                    min(left_score, right_score),
+                    (left_score + right_score) / 2,
+                ),
                 position,
                 candidate,
                 left_score,
@@ -1515,8 +2047,10 @@ def get_frog_alternatives(
         spotify_resolver,
     )
 
-    observed_current_left = _observed_transition_similarity(left, current, adjacency)
-    observed_current_right = _observed_transition_similarity(current, right, adjacency)
+    current_left_evidence = _transition_evidence(left, current, adjacency)
+    current_right_evidence = _transition_evidence(current, right, adjacency)
+    observed_current_left = current_left_evidence["observed_similarity"]
+    observed_current_right = current_right_evidence["observed_similarity"]
     current_left = (
         max(0.0, min(1.0, float(current_left_similarity)))
         if current_left_similarity is not None
@@ -1528,6 +2062,24 @@ def get_frog_alternatives(
         else observed_current_right
     )
     current_floor = min(current_left, current_right)
+    # A route transition can come from the path search's recorded one-way edge
+    # even when re-querying normalized Spotify names does not reproduce that
+    # edge. In that case the caller's displayed route score is still observed
+    # evidence; use it instead of inventing a 0% conservative baseline.
+    conservative_current_left = (
+        current_left_evidence["conservative_similarity"]
+        if current_left_evidence["direction_count"]
+        else current_left
+    )
+    conservative_current_right = (
+        current_right_evidence["conservative_similarity"]
+        if current_right_evidence["direction_count"]
+        else current_right
+    )
+    conservative_current_floor = min(
+        conservative_current_left,
+        conservative_current_right,
+    )
     alternatives = []
 
     for _, _, candidate, left_score, right_score in scored_candidates:
@@ -1536,7 +2088,24 @@ def get_frog_alternatives(
         if not spotify_track_id or spotify_track_id in used_spotify_ids:
             continue
 
+        left_evidence = _transition_evidence(left, candidate, adjacency)
+        right_evidence = _transition_evidence(candidate, right, adjacency)
         bottleneck = min(left_score, right_score)
+        conservative_left = left_evidence["conservative_similarity"]
+        conservative_right = right_evidence["conservative_similarity"]
+        conservative_bottleneck = min(conservative_left, conservative_right)
+        direction_count = (
+            left_evidence["direction_count"] + right_evidence["direction_count"]
+        )
+        confidence_score = direction_count / 4
+        confidence_level = (
+            "high"
+            if direction_count == 4
+            else ("medium" if direction_count == 3 else "limited")
+        )
+        bidirectional_hops = int(left_evidence["bidirectional"]) + int(
+            right_evidence["bidirectional"]
+        )
         formatted = format_track(
             spotify_track,
             position,
@@ -1550,6 +2119,40 @@ def get_frog_alternatives(
             "bottleneck_similarity": round(bottleneck, 4),
             "average_similarity": round((left_score + right_score) / 2, 4),
             "improvement": round(bottleneck - current_floor, 4),
+            "ranking_score": round(conservative_bottleneck, 4),
+            "conservative_improvement": round(
+                conservative_bottleneck - conservative_current_floor,
+                4,
+            ),
+            "confidence": {
+                "level": confidence_level,
+                "score": round(confidence_score, 2),
+                "basis": (
+                    "share_of_four_possible_directional_lastfm_links_observed"
+                ),
+            },
+            "reason": _alternative_reason(
+                conservative_left,
+                conservative_right,
+                bidirectional_hops,
+            ),
+            "evidence": {
+                "source": "lastfm_track_similarity",
+                "both_neighbors_linked": True,
+                "left_edge": _format_alternative_edge_evidence(
+                    left_evidence,
+                    forward_label="left_neighbor_to_candidate",
+                    reverse_label="candidate_to_left_neighbor",
+                ),
+                "right_edge": _format_alternative_edge_evidence(
+                    right_evidence,
+                    forward_label="candidate_to_right_neighbor",
+                    reverse_label="right_neighbor_to_candidate",
+                ),
+                "ranking_basis": (
+                    "weakest_directional_observation_on_the_weaker_neighbor_hop"
+                ),
+            },
         })
         used_spotify_ids.add(spotify_track_id)
         if len(alternatives) >= limit:
@@ -1575,5 +2178,9 @@ def get_frog_alternatives(
             transition_similarity=round(current_right, 4),
         ),
         "current_bottleneck": round(current_floor, 4),
+        "current_conservative_bottleneck": round(
+            conservative_current_floor,
+            4,
+        ),
         "alternatives": alternatives,
     }

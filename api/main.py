@@ -5,6 +5,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import json
 import os
+import threading
 
 from .services.analyzer import (
     get_overview, get_overview_split, get_top_artists_stats, get_top_genres_stats,
@@ -23,6 +24,11 @@ from .services.podcasts import (
 )
 
 app = FastAPI(title="Spotify History Recommendations", version="2.0.0")
+
+# A disconnected browser cannot interrupt a synchronous Spotify/Last.fm batch
+# already in flight. Keep abandoned retries from piling up while that batch
+# winds down; a second slot still lets a deliberate retry make progress.
+_FROG_JOB_SLOTS = threading.BoundedSemaphore(value=2)
 
 configured_origins = [
     origin.strip()
@@ -339,11 +345,19 @@ def recommendations_frog(request: FrogPlaylistRequest):
     if request.track_count > 50:
         raise HTTPException(status_code=400, detail="Track count must be at most 50")
 
-    result = generate_frog_playlist(
-        start_track_id=request.start_track_id,
-        end_track_id=request.end_track_id,
-        track_count=request.track_count,
-    )
+    if not _FROG_JOB_SLOTS.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="Two Frog jobs are already winding through the graph. Try again shortly.",
+        )
+    try:
+        result = generate_frog_playlist(
+            start_track_id=request.start_track_id,
+            end_track_id=request.end_track_id,
+            track_count=request.track_count,
+        )
+    finally:
+        _FROG_JOB_SLOTS.release()
 
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to generate playlist"))
@@ -373,12 +387,24 @@ def recommendations_frog_stream(request: FrogPlaylistRequest):
         raise HTTPException(status_code=400, detail="Track count must be at most 50")
 
     def event_generator():
-        for event in generate_frog_playlist_streaming(
-            start_track_id=request.start_track_id,
-            end_track_id=request.end_track_id,
-            track_count=request.track_count,
-        ):
-            yield f"data: {json.dumps(event)}\n\n"
+        if not _FROG_JOB_SLOTS.acquire(blocking=False):
+            yield "data: " + json.dumps({
+                "type": "error",
+                "error": (
+                    "Two Frog jobs are already winding through the graph. "
+                    "Try again shortly."
+                ),
+            }) + "\n\n"
+            return
+        try:
+            for event in generate_frog_playlist_streaming(
+                start_track_id=request.start_track_id,
+                end_track_id=request.end_track_id,
+                track_count=request.track_count,
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+        finally:
+            _FROG_JOB_SLOTS.release()
 
     return StreamingResponse(
         event_generator(),
@@ -401,13 +427,24 @@ def recommendations_frog_alternatives(request: FrogAlternativesRequest):
         raise HTTPException(status_code=400, detail="Route tracks must be distinct")
 
     try:
-        return get_frog_alternatives(
-            request.track_ids,
-            request.position,
-            request.limit,
-            current_left_similarity=request.current_left_similarity,
-            current_right_similarity=request.current_right_similarity,
-        )
+        if not _FROG_JOB_SLOTS.acquire(blocking=False):
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Two Frog jobs are already winding through the graph. "
+                    "Try again shortly."
+                ),
+            )
+        try:
+            return get_frog_alternatives(
+                request.track_ids,
+                request.position,
+                request.limit,
+                current_left_similarity=request.current_left_similarity,
+                current_right_similarity=request.current_right_similarity,
+            )
+        finally:
+            _FROG_JOB_SLOTS.release()
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
 

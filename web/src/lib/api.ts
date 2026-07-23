@@ -347,6 +347,22 @@ export interface FrogGraphEdge {
 export interface FrogExploration {
   nodes: FrogGraphNode[];
   edges: FrogGraphEdge[];
+  total_nodes?: number;
+  total_edges?: number;
+  retained_nodes?: number;
+  retained_edges?: number;
+  omitted_nodes?: number;
+  omitted_edges?: number;
+  omitted_search_nodes?: number;
+  omitted_search_edges?: number;
+  node_limit?: number;
+  edge_limit?: number;
+  route_nodes?: number;
+  route_edges?: number;
+  totals_scope?: 'search' | string;
+  sampled?: boolean;
+  truncated?: boolean;
+  budget_truncated?: boolean;
 }
 
 export interface FrogPlaylistRequest {
@@ -418,6 +434,33 @@ export interface FrogErrorEvent {
 
 export type FrogStreamEvent = FrogProgressEvent | FrogResultEvent | FrogErrorEvent;
 
+export interface FrogAlternativeObservation {
+  direction: string;
+  similarity: number;
+}
+
+export interface FrogAlternativeEdgeEvidence {
+  observations: FrogAlternativeObservation[];
+  direction_count: number;
+  bidirectional: boolean;
+  observed_similarity: number;
+  conservative_similarity: number;
+}
+
+export interface FrogAlternativeConfidence {
+  level: 'high' | 'medium' | 'limited' | string;
+  score: number;
+  basis: string;
+}
+
+export interface FrogAlternativeEvidence {
+  source: string;
+  both_neighbors_linked: boolean;
+  ranking_basis: string;
+  left_edge: FrogAlternativeEdgeEvidence;
+  right_edge: FrogAlternativeEdgeEvidence;
+}
+
 export interface FrogAlternative {
   track: FrogTrack;
   left_similarity: number;
@@ -425,6 +468,11 @@ export interface FrogAlternative {
   bottleneck_similarity: number;
   average_similarity: number;
   improvement: number;
+  ranking_score?: number;
+  conservative_improvement?: number;
+  confidence?: FrogAlternativeConfidence;
+  reason?: string;
+  evidence?: FrogAlternativeEvidence;
 }
 
 export interface FrogAlternativesResult {
@@ -433,6 +481,7 @@ export interface FrogAlternativesResult {
   current_track: FrogTrack;
   right_track: FrogTrack;
   current_bottleneck: number;
+  current_conservative_bottleneck?: number;
   alternatives: FrogAlternative[];
 }
 
@@ -442,6 +491,7 @@ export const getFrogAlternatives = (
   currentLeftSimilarity?: number | null,
   currentRightSimilarity?: number | null,
   limit = 8,
+  signal?: AbortSignal,
 ) =>
   api.post<FrogAlternativesResult>('/recommendations/frog/alternatives', {
     track_ids: trackIds,
@@ -449,7 +499,7 @@ export const getFrogAlternatives = (
     limit,
     current_left_similarity: currentLeftSimilarity,
     current_right_similarity: currentRightSimilarity,
-  }).then(r => r.data);
+  }, { signal }).then(r => r.data);
 
 export const generateFrogPlaylistStreaming = (
   request: FrogPlaylistRequest,
@@ -504,10 +554,10 @@ export const generateFrogPlaylistStreaming = (
             const data = line.slice(6);
             try {
               const event = JSON.parse(data) as FrogStreamEvent;
+              if (finished) continue;
               if (event.type === 'progress') {
                 onProgress(event);
               } else if (event.type === 'result') {
-                if (finished) continue;
                 finished = true;
                 onResult(event);
               } else if (event.type === 'error') {

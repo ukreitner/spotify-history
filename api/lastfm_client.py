@@ -56,7 +56,7 @@ def get_similar_tracks(artist: str, track: str, limit: int = 100) -> List[Dict]:
         return results
 
     except Exception as e:
-        print(f"Last.fm track.getSimilar error for '{artist}' - '{track}': {e}")
+        print(f"Last.fm track.getSimilar error: {type(e).__name__}")
         return []
 
 
@@ -102,7 +102,7 @@ def get_similar_artists(artist_name: str, limit: int = 20) -> List[Dict]:
         return results
 
     except Exception as e:
-        print(f"Last.fm API error for '{artist_name}': {e}")
+        print(f"Last.fm artist lookup error: {type(e).__name__}")
         return []
 
 

@@ -4,6 +4,7 @@
 # Safe to run repeatedly: healthy services are reused instead of duplicated.
 
 set -u
+umask 077
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 WEB_DIR="$ROOT_DIR/web"
@@ -21,6 +22,8 @@ LAUNCH_LOG="$RUNTIME_DIR/launcher.log"
 BACKEND_LOG="$RUNTIME_DIR/backend.log"
 FRONTEND_LOG="$RUNTIME_DIR/frontend.log"
 LOCK_DIR="$RUNTIME_DIR/launcher.lock"
+touch "$LAUNCH_LOG" "$BACKEND_LOG" "$FRONTEND_LOG"
+chmod 600 "$LAUNCH_LOG" "$BACKEND_LOG" "$FRONTEND_LOG"
 
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LAUNCH_LOG"
