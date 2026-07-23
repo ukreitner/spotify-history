@@ -93,12 +93,7 @@ export default function PlaylistsPage() {
       (result) => {
         setFrogLoading(false);
         setFrogProgress(null);
-        setFrogResult({
-          tracks: result.tracks,
-          path_length: result.path_length,
-          sampled_length: result.sampled_length,
-          success: result.success,
-        });
+        setFrogResult(result);
       },
       (error) => {
         setFrogLoading(false);
@@ -630,7 +625,9 @@ export default function PlaylistsPage() {
                 <>
                   <h4 className="font-medium text-sm mb-2">How it works</h4>
                   <p className="text-xs text-[var(--text-muted)]">
-                    The algorithm uses A* pathfinding over Last.fm&apos;s track similarity graph to find the smoothest musical journey from your start track to your end track.
+                    Frog Mode finds a short route spine, then subdivides its weakest
+                    jumps until it reaches your exact song count. Every inserted song
+                    must be similar to both of its neighbors.
                   </p>
                 </>
               )}
@@ -760,9 +757,12 @@ export default function PlaylistsPage() {
                   <div>
                     <h3 className="font-semibold">{frogPlaylistName}</h3>
                     <p className="text-sm text-[var(--text-muted)]">
-                      {frogResult.tracks.length} tracks
-                      {frogResult.path_length !== frogResult.sampled_length && (
-                        <span> (sampled from {frogResult.path_length})</span>
+                      {frogResult.tracks.length} / {frogResult.requested_length || frogResult.tracks.length} tracks
+                      {frogResult.weakest_transition !== undefined && (
+                        <span>
+                          {' '}· weakest hop {(frogResult.weakest_transition * 100).toFixed(0)}%
+                          {' '}· average {(frogResult.average_transition! * 100).toFixed(0)}%
+                        </span>
                       )}
                     </p>
                   </div>
@@ -808,7 +808,11 @@ export default function PlaylistsPage() {
                         imageUrl={track.image_url}
                         previewUrl={track.preview_url}
                         spotifyUrl={track.spotify_url}
-                        subtitle={track.role}
+                        subtitle={
+                          track.transition_similarity == null
+                            ? track.role
+                            : `${track.role} · ${(track.transition_similarity * 100).toFixed(0)}% similar to previous`
+                        }
                         index={i}
                       />
                     </div>

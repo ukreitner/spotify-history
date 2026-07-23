@@ -320,6 +320,7 @@ export interface FrogTrack {
   spotify_url?: string | null;
   position: number;
   role: 'start' | 'bridge' | 'end' | string;
+  transition_similarity?: number | null;
 }
 
 export interface FrogPlaylistRequest {
@@ -332,6 +333,10 @@ export interface FrogPlaylistResult {
   tracks: FrogTrack[];
   path_length: number;
   sampled_length: number;
+  requested_length?: number;
+  spine_length?: number;
+  weakest_transition?: number;
+  average_transition?: number;
   success: boolean;
   error?: string;
 }
@@ -343,7 +348,7 @@ export const generateFrogPlaylist = (request: FrogPlaylistRequest) =>
 
 export interface FrogProgressEvent {
   type: 'progress';
-  phase: 'init' | 'neighborhood' | 'search' | 'resolving';
+  phase: 'init' | 'neighborhood' | 'search' | 'expanding' | 'resolving';
   message?: string;
   iteration?: number;
   visited?: number;
@@ -361,6 +366,10 @@ export interface FrogResultEvent {
   tracks: FrogTrack[];
   path_length: number;
   sampled_length: number;
+  requested_length?: number;
+  spine_length?: number;
+  weakest_transition?: number;
+  average_transition?: number;
   success: boolean;
 }
 

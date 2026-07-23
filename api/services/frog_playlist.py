@@ -6,9 +6,15 @@ using A* pathfinding over Last.fm's track similarity graph.
 """
 
 import heapq
-from typing import List, Dict, Optional, Set, Tuple
+import re
+import unicodedata
+from collections import Counter
+from difflib import SequenceMatcher
+from typing import Callable, List, Dict, Optional, Set, Tuple
 from ..lastfm_client import get_similar_tracks, get_similar_tracks_batch
 from ..spotify_client import search_tracks_advanced, get_tracks_bulk
+
+MIN_FROG_TRANSITION = 0.70
 
 
 def compute_heuristic(
@@ -151,15 +157,394 @@ def resolve_to_spotify(artist: str, track: str) -> Optional[Dict]:
     if not results:
         return None
 
-    # Find best match (artist name should match)
-    artist_lower = artist.lower()
-    for r in results:
-        track_artists = [a.get("name", "").lower() for a in r.get("artists", [])]
-        if any(artist_lower in a or a in artist_lower for a in track_artists):
-            return r
+    wanted_artist = _normalized_text(artist)
+    wanted_track = _normalized_track_name(track)
+    best: Optional[Tuple[float, Dict]] = None
 
-    # Fallback to first result if no exact artist match
-    return results[0] if results else None
+    for result in results:
+        result_track = _normalized_track_name(result.get("name", ""))
+        artist_scores = [
+            _text_similarity(wanted_artist, _normalized_text(item.get("name", "")))
+            for item in result.get("artists", [])
+        ]
+        artist_score = max(artist_scores, default=0.0)
+        track_score = _text_similarity(wanted_track, result_track)
+
+        # Requiring both halves prevents a popular but unrelated first search
+        # result from silently becoming a giant musical jump.
+        if artist_score < 0.58 or track_score < 0.62:
+            continue
+
+        score = (artist_score * 0.55) + (track_score * 0.45)
+        if best is None or score > best[0]:
+            best = (score, result)
+
+    return best[1] if best else None
+
+
+def _normalized_text(value: str) -> str:
+    """Normalize artist/title text for stable identity and fuzzy matching."""
+    value = unicodedata.normalize("NFKD", value or "")
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", value.lower()).split())
+
+
+def _normalized_track_name(value: str) -> str:
+    """Ignore common release labels while retaining the actual song title."""
+    value = re.sub(
+        r"\s*[\(\[][^)\]]*(?:remaster|remix|version|edit|live|mono|stereo)[^)\]]*[\)\]]",
+        "",
+        value or "",
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
+        r"\s*[-–—]\s*(?:\d{4}\s+)?(?:remaster(?:ed)?|remix|radio edit|live).*$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return _normalized_text(value)
+
+
+def _text_similarity(left: str, right: str) -> float:
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    if left in right or right in left:
+        return min(len(left), len(right)) / max(len(left), len(right))
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def track_key(track: Dict) -> Tuple[str, str]:
+    """Canonical Last.fm identity for a route node."""
+    return (
+        _normalized_text(track.get("artist", "")),
+        _normalized_track_name(track.get("name", "")),
+    )
+
+
+def _spotify_id(track: Optional[Dict]) -> Optional[str]:
+    return track.get("id") if track else None
+
+
+def _adjacency_for(
+    nodes: List[Dict],
+    cache: Dict[Tuple[str, str], Dict[Tuple[str, str], Tuple[Dict, float]]],
+    similarity_fetcher: Callable,
+    limit: int,
+) -> None:
+    """Populate normalized similarity lists for any nodes not already cached."""
+    missing = [node for node in nodes if track_key(node) not in cache]
+    if not missing:
+        return
+
+    requests = [(node["artist"], node["name"]) for node in missing]
+    results = similarity_fetcher(requests, limit=limit, max_workers=min(20, len(requests)))
+
+    for node, request_key in zip(missing, requests):
+        normalized_neighbors: Dict[Tuple[str, str], Tuple[Dict, float]] = {}
+        for neighbor in results.get(request_key, []):
+            key = track_key(neighbor)
+            if not all(key) or key == track_key(node):
+                continue
+            score = max(0.0, min(1.0, float(neighbor.get("match", 0.0))))
+            previous = normalized_neighbors.get(key)
+            if previous is None or score > previous[1]:
+                normalized_neighbors[key] = (neighbor, score)
+        cache[track_key(node)] = normalized_neighbors
+
+
+def _transition_similarity(
+    left: Dict,
+    right: Dict,
+    cache: Dict[Tuple[str, str], Dict[Tuple[str, str], Tuple[Dict, float]]],
+) -> float:
+    """Best observed directional Last.fm similarity for an adjacent pair."""
+    left_key = track_key(left)
+    right_key = track_key(right)
+    observations: List[float] = []
+
+    if right_key in cache.get(left_key, {}):
+        observations.append(cache[left_key][right_key][1])
+    if left_key in cache.get(right_key, {}):
+        observations.append(cache[right_key][left_key][1])
+
+    # A node's match is the edge score recorded by the original graph search.
+    if not observations:
+        fallback = right.get("match")
+        if fallback is not None:
+            observations.append(float(fallback))
+
+    return max(observations, default=0.0)
+
+
+def _candidate_insertions(
+    route: List[Dict],
+    cache: Dict[Tuple[str, str], Dict[Tuple[str, str], Tuple[Dict, float]]],
+    used_keys: Set[Tuple[str, str]],
+    max_per_artist: Optional[int] = None,
+) -> List[Tuple[Tuple[float, ...], int, Dict, float, float]]:
+    """
+    Rank one-song subdivisions of every edge.
+
+    The first ranking term is the resulting route's weakest hop. This makes
+    bottleneck quality, rather than a deceptively good average, the primary
+    optimization target.
+    """
+    edge_scores = [
+        _transition_similarity(route[index], route[index + 1], cache)
+        for index in range(len(route) - 1)
+    ]
+    artist_counts = Counter(track_key(node)[0] for node in route)
+    insertions = []
+
+    for index, (left, right) in enumerate(zip(route, route[1:])):
+        left_key = track_key(left)
+        right_key = track_key(right)
+        left_neighbors = cache.get(left_key, {})
+        right_neighbors = cache.get(right_key, {})
+
+        # Start with common neighbors. Once a candidate's own neighborhood has
+        # been fetched, the broader union also admits asymmetric Last.fm links.
+        candidate_keys = set(left_neighbors) | set(right_neighbors)
+        other_scores = edge_scores[:index] + edge_scores[index + 1:]
+        other_floor = min(other_scores, default=1.0)
+
+        for candidate_key in candidate_keys:
+            if candidate_key in used_keys:
+                continue
+
+            candidate_entry = left_neighbors.get(candidate_key) or right_neighbors.get(candidate_key)
+            if not candidate_entry:
+                continue
+            candidate = candidate_entry[0]
+            artist = candidate_key[0]
+            if max_per_artist is not None and artist_counts[artist] >= max_per_artist:
+                continue
+
+            left_score = _transition_similarity(left, candidate, cache)
+            right_score = _transition_similarity(candidate, right, cache)
+            if left_score <= 0 or right_score <= 0:
+                continue
+
+            local_floor = min(left_score, right_score)
+            resulting_floor = min(other_floor, local_floor)
+            edge_relief = local_floor - edge_scores[index]
+            same_neighbor_artist = int(
+                artist in {track_key(left)[0], track_key(right)[0]}
+            )
+            rank = (
+                resulting_floor,
+                -same_neighbor_artist,
+                -artist_counts[artist],
+                local_floor,
+                (left_score + right_score) / 2,
+                edge_relief,
+            )
+            insertions.append((rank, index, candidate, left_score, right_score))
+
+    return sorted(insertions, key=lambda item: item[0], reverse=True)
+
+
+def _broaden_candidate_graph(
+    route: List[Dict],
+    cache: Dict[Tuple[str, str], Dict[Tuple[str, str], Tuple[Dict, float]]],
+    used_keys: Set[Tuple[str, str]],
+    similarity_fetcher: Callable,
+    limit: int,
+    candidates_per_endpoint: int = 12,
+) -> None:
+    """
+    Fetch promising one-sided neighbors so asymmetric two-sided links appear.
+
+    Last.fm's ranked lists are not perfectly symmetric. A candidate omitted
+    from B's top list can still rate B highly in its own list.
+    """
+    edge_scores = [
+        (_transition_similarity(route[index], route[index + 1], cache), index)
+        for index in range(len(route) - 1)
+    ]
+    candidates: List[Dict] = []
+    seen: Set[Tuple[str, str]] = set()
+
+    for _, index in sorted(edge_scores)[: min(5, len(edge_scores))]:
+        left, right = route[index], route[index + 1]
+        for endpoint in (left, right):
+            neighbors = sorted(
+                cache.get(track_key(endpoint), {}).values(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            for candidate, _ in neighbors[:candidates_per_endpoint]:
+                key = track_key(candidate)
+                if key in used_keys or key in seen or key in cache:
+                    continue
+                seen.add(key)
+                candidates.append(candidate)
+
+    _adjacency_for(candidates, cache, similarity_fetcher, limit)
+
+
+def expand_path_to_exact_length(
+    path: List[Dict],
+    target_length: int,
+    *,
+    spotify_resolver: Callable[[str, str], Optional[Dict]] = resolve_to_spotify,
+    similarity_fetcher: Callable = get_similar_tracks_batch,
+    similarity_limit: int = 100,
+) -> Tuple[Optional[List[Dict]], Dict]:
+    """
+    Grow a valid graph path to exactly ``target_length`` distinct Spotify songs.
+
+    Each insertion subdivides an existing edge with a track similar to both
+    neighbors. The global bottleneck is optimized first, followed by local
+    smoothness and artist diversity.
+    """
+    if target_length < 2:
+        return None, {"error": "The requested route must contain at least two songs."}
+
+    route = [dict(node) for node in path]
+    adjacency: Dict[Tuple[str, str], Dict[Tuple[str, str], Tuple[Dict, float]]] = {}
+    resolver_cache: Dict[Tuple[str, str], Optional[Dict]] = {}
+    _adjacency_for(route, adjacency, similarity_fetcher, similarity_limit)
+
+    # Shortest-path searches can occasionally return more nodes than a small
+    # request. Contract only where the new neighboring pair has an observed
+    # similarity link, optimizing the resulting bottleneck at each removal.
+    while len(route) > target_length:
+        removals = []
+        for index in range(1, len(route) - 1):
+            bridge_score = _transition_similarity(route[index - 1], route[index + 1], adjacency)
+            if bridge_score <= 0:
+                continue
+            candidate = route[:index] + route[index + 1:]
+            scores = [
+                _transition_similarity(candidate[pos], candidate[pos + 1], adjacency)
+                for pos in range(len(candidate) - 1)
+            ]
+            removals.append((min(scores, default=0.0), sum(scores), index))
+
+        if not removals:
+            return None, {
+                "error": (
+                    f"Could not contract the discovered path to exactly "
+                    f"{target_length} smooth songs."
+                ),
+                "built_length": len(route),
+            }
+        _, _, remove_index = max(removals)
+        route.pop(remove_index)
+
+    # Artist diversity remains a ranking tie-breaker, not a hard constraint.
+    # A cap can force an objectively worse jump, which violates Frog Mode's
+    # primary promise that every transition should be tiny.
+    base_route = [dict(node) for node in route]
+    initial_artist_limit = target_length
+    maximum_artist_limit = initial_artist_limit
+    best_quality: Optional[Dict] = None
+    longest_attempt = len(base_route)
+
+    for artist_limit in range(initial_artist_limit, maximum_artist_limit + 1):
+        route = [dict(node) for node in base_route]
+        used_keys = {track_key(node) for node in route}
+        used_spotify_ids = {
+            spotify_id
+            for spotify_id in (_spotify_id(node.get("_spotify")) for node in route)
+            if spotify_id
+        }
+        build_failed = False
+
+        while len(route) < target_length:
+            selected = None
+            for discovery_round in range(3):
+                insertions = _candidate_insertions(
+                    route,
+                    adjacency,
+                    used_keys,
+                    max_per_artist=artist_limit,
+                )
+                for _, index, candidate, _, _ in insertions:
+                    key = track_key(candidate)
+                    if key not in resolver_cache:
+                        resolver_cache[key] = spotify_resolver(
+                            candidate["artist"],
+                            candidate["name"],
+                        )
+                    spotify_track = resolver_cache[key]
+                    spotify_track_id = _spotify_id(spotify_track)
+                    if not spotify_track_id or spotify_track_id in used_spotify_ids:
+                        continue
+                    selected = (index, dict(candidate), spotify_track)
+                    break
+
+                if selected is not None:
+                    break
+
+                _broaden_candidate_graph(
+                    route,
+                    adjacency,
+                    used_keys,
+                    similarity_fetcher,
+                    similarity_limit,
+                    candidates_per_endpoint=12 * (discovery_round + 1),
+                )
+
+            if selected is None:
+                longest_attempt = max(longest_attempt, len(route))
+                build_failed = True
+                break
+
+            index, candidate, spotify_track = selected
+            candidate["_spotify"] = spotify_track
+            route.insert(index + 1, candidate)
+            used_keys.add(track_key(candidate))
+            used_spotify_ids.add(spotify_track["id"])
+            _adjacency_for(
+                [candidate],
+                adjacency,
+                similarity_fetcher,
+                similarity_limit,
+            )
+
+        if build_failed:
+            continue
+
+        transition_scores = [
+            _transition_similarity(route[index], route[index + 1], adjacency)
+            for index in range(len(route) - 1)
+        ]
+        metrics = {
+            "weakest_transition": round(min(transition_scores, default=1.0), 4),
+            "average_transition": round(
+                sum(transition_scores) / len(transition_scores),
+                4,
+            ) if transition_scores else 1.0,
+            "transition_scores": [round(score, 4) for score in transition_scores],
+            "max_per_artist": artist_limit,
+        }
+        if best_quality is None or metrics["weakest_transition"] > best_quality["weakest_transition"]:
+            best_quality = metrics
+        if metrics["weakest_transition"] >= MIN_FROG_TRANSITION:
+            return route, metrics
+
+    if best_quality is not None:
+        return None, {
+            **best_quality,
+            "built_length": target_length,
+            "error": (
+                "A route of the requested length was found, but at least one "
+                f"jump scored below the {MIN_FROG_TRANSITION:.0%} smoothness floor. "
+                "Try closer endpoints."
+            ),
+        }
+    return None, {
+        "error": (
+            f"Could not build a smooth {target_length}-song route with distinct "
+            "Spotify tracks. Try closer endpoints or a shorter route."
+        ),
+        "built_length": longest_attempt,
+    }
 
 
 def resolve_path_to_spotify(path: List[Dict]) -> List[Dict]:
@@ -209,6 +594,99 @@ def sample_evenly(path: List, target_length: int) -> List:
     result[-1] = path[-1]
 
     return result
+
+
+def _resolve_spine(
+    path: List[Dict],
+    start_spotify: Dict,
+    end_spotify: Dict,
+) -> Tuple[Optional[List[Dict]], Optional[str]]:
+    """Resolve every skeleton node before it is counted toward route length."""
+    if len(path) < 2:
+        return None, "The route skeleton did not contain both endpoints."
+
+    resolved: List[Dict] = []
+    used_ids: Set[str] = set()
+    for index, raw_node in enumerate(path):
+        node = dict(raw_node)
+        if index == 0:
+            spotify_track = start_spotify
+        elif index == len(path) - 1:
+            spotify_track = end_spotify
+        else:
+            spotify_track = resolve_to_spotify(node["artist"], node["name"])
+
+        spotify_track_id = _spotify_id(spotify_track)
+        if not spotify_track_id:
+            return None, (
+                f"Could not find the bridge track {node['artist']} - "
+                f"{node['name']} on Spotify."
+            )
+        if spotify_track_id in used_ids:
+            return None, "The route skeleton contained duplicate Spotify tracks."
+
+        node["_spotify"] = spotify_track
+        used_ids.add(spotify_track_id)
+        resolved.append(node)
+
+    return resolved, None
+
+
+def _build_exact_result(
+    path: List[Dict],
+    start_spotify: Dict,
+    end_spotify: Dict,
+    track_count: int,
+) -> Dict:
+    """Resolve, expand, score, and format an exact-length Frog route."""
+    spine_length = len(path)
+    spine, error = _resolve_spine(path, start_spotify, end_spotify)
+    if not spine:
+        return {
+            "tracks": [],
+            "path_length": 0,
+            "sampled_length": 0,
+            "requested_length": track_count,
+            "success": False,
+            "error": error or "Could not resolve the route skeleton on Spotify.",
+        }
+
+    exact_path, quality = expand_path_to_exact_length(spine, track_count)
+    if not exact_path:
+        return {
+            "tracks": [],
+            "path_length": 0,
+            "sampled_length": quality.get("built_length", len(spine)),
+            "requested_length": track_count,
+            "spine_length": spine_length,
+            "success": False,
+            "error": quality.get("error", "Could not build the requested route."),
+        }
+
+    scores = quality["transition_scores"]
+    spotify_tracks = []
+    for index, node in enumerate(exact_path):
+        role = "start" if index == 0 else ("end" if index == len(exact_path) - 1 else "bridge")
+        transition = None if index == 0 else scores[index - 1]
+        spotify_tracks.append(
+            format_track(
+                node["_spotify"],
+                index,
+                role,
+                transition_similarity=transition,
+            )
+        )
+
+    return {
+        "tracks": spotify_tracks,
+        "path_length": len(exact_path),
+        "sampled_length": len(spotify_tracks),
+        "requested_length": track_count,
+        "spine_length": spine_length,
+        "weakest_transition": quality["weakest_transition"],
+        "average_transition": quality["average_transition"],
+        "success": len(spotify_tracks) == track_count,
+    }
 
 
 def generate_frog_playlist(
@@ -279,40 +757,7 @@ def generate_frog_playlist(
             "error": "No path found between tracks. They may be too different.",
         }
 
-    original_length = len(path)
-
-    # Sample if path is longer than target
-    if len(path) > track_count:
-        path = sample_evenly(path, track_count)
-
-    # Resolve to Spotify tracks
-    # First and last should use the original Spotify data we already have
-    spotify_tracks = []
-
-    # Add start track
-    spotify_tracks.append(format_track(start_spotify, 0, "start"))
-
-    # Resolve middle tracks
-    if len(path) > 2:
-        middle_path = path[1:-1]
-        for i, track in enumerate(middle_path):
-            spotify_track = resolve_to_spotify(track["artist"], track["name"])
-            if spotify_track:
-                spotify_tracks.append(format_track(
-                    spotify_track,
-                    i + 1,
-                    f"bridge ({track.get('match', 0):.0%} similar)"
-                ))
-
-    # Add end track
-    spotify_tracks.append(format_track(end_spotify, len(spotify_tracks), "end"))
-
-    return {
-        "tracks": spotify_tracks,
-        "path_length": original_length,
-        "sampled_length": len(spotify_tracks),
-        "success": True,
-    }
+    return _build_exact_result(path, start_spotify, end_spotify, track_count)
 
 
 def generate_frog_playlist_streaming(
@@ -392,47 +837,26 @@ def generate_frog_playlist_streaming(
         }
         return
 
-    original_length = len(path)
+    spine_length = len(path)
 
     yield {
         "type": "progress",
-        "phase": "resolving",
-        "message": f"Found path with {original_length} tracks, resolving to Spotify...",
+        "phase": "expanding",
+        "message": (
+            f"Found a {spine_length}-song spine. Growing it into exactly "
+            f"{track_count} tiny hops..."
+        ),
     }
 
-    # Sample if path is longer than target
-    if len(path) > track_count:
-        path = sample_evenly(path, track_count)
+    result = _build_exact_result(path, start_spotify, end_spotify, track_count)
+    if not result.get("success"):
+        yield {
+            "type": "error",
+            "error": result.get("error", "Could not build the requested route."),
+        }
+        return
 
-    # Resolve to Spotify tracks
-    spotify_tracks = []
-
-    # Add start track
-    spotify_tracks.append(format_track(start_spotify, 0, "start"))
-
-    # Resolve middle tracks
-    if len(path) > 2:
-        middle_path = path[1:-1]
-        for i, track in enumerate(middle_path):
-            spotify_track = resolve_to_spotify(track["artist"], track["name"])
-            if spotify_track:
-                spotify_tracks.append(format_track(
-                    spotify_track,
-                    i + 1,
-                    f"bridge ({track.get('match', 0):.0%} similar)"
-                ))
-
-    # Add end track
-    spotify_tracks.append(format_track(end_spotify, len(spotify_tracks), "end"))
-
-    # Final result
-    yield {
-        "type": "result",
-        "tracks": spotify_tracks,
-        "path_length": original_length,
-        "sampled_length": len(spotify_tracks),
-        "success": True,
-    }
+    yield {"type": "result", **result}
 
 
 def astar_find_path_streaming(
@@ -615,7 +1039,12 @@ def astar_find_path_streaming(
     yield {"type": "result", "path": None, "iterations": iterations}
 
 
-def format_track(spotify_track: Dict, position: int, role: str) -> Dict:
+def format_track(
+    spotify_track: Dict,
+    position: int,
+    role: str,
+    transition_similarity: Optional[float] = None,
+) -> Dict:
     """Format a Spotify track for the response."""
     album = spotify_track.get("album", {})
     images = album.get("images", [])
@@ -630,4 +1059,5 @@ def format_track(spotify_track: Dict, position: int, role: str) -> Dict:
         "spotify_url": spotify_track.get("external_urls", {}).get("spotify"),
         "position": position,
         "role": role,
+        "transition_similarity": transition_similarity,
     }

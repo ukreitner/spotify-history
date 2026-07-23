@@ -358,6 +358,12 @@ def recommendations_frog_stream(request: FrogPlaylistRequest):
     if request.start_track_id == request.end_track_id:
         raise HTTPException(status_code=400, detail="Start and end tracks must be different")
 
+    if request.track_count < 3:
+        raise HTTPException(status_code=400, detail="Track count must be at least 3")
+
+    if request.track_count > 50:
+        raise HTTPException(status_code=400, detail="Track count must be at most 50")
+
     def event_generator():
         for event in generate_frog_playlist_streaming(
             start_track_id=request.start_track_id,
