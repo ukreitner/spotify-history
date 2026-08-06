@@ -10,8 +10,9 @@ scripts/install_macos_launcher.sh
 
 Then open **Listening Archive** from `~/Applications` or Spotlight. The launcher:
 
-- reuses the local API and web app when they are already running;
-- otherwise pulls the newest archived history when the checkout is clean;
+- pulls the newest archived history when the checkout is clean, even when the
+  local services are already running;
+- reuses the local API and web app when they are already healthy;
 - prepares missing dependencies and the production build;
 - starts both local services; and
 - opens `http://127.0.0.1:3000` in Google Chrome.

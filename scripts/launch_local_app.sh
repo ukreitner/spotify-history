@@ -67,19 +67,21 @@ trap 'rmdir "$LOCK_DIR" >/dev/null 2>&1 || true' EXIT
 cd "$ROOT_DIR" || exit 1
 log "Launcher invoked."
 
-if is_ready "$API_STATUS_URL" && is_ready "$FRONTEND_STATUS_URL"; then
-  log "Services already healthy; opening Chrome."
-  open_archive
-  exit 0
-fi
-
 # Pull fresh history when the checkout is clean. Network or authentication
-# failures do not prevent the last local snapshot from opening.
+# failures do not prevent the last local snapshot from opening. Do this before
+# reusing healthy services: the API discovers the monthly databases per request,
+# so a click can refresh the archive without restarting either process.
 if [[ -z "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
   log "Checking GitHub for newer listening history."
   git pull --ff-only origin main >> "$LAUNCH_LOG" 2>&1 || log "Git pull failed; continuing with the local snapshot."
 else
   log "Skipping git pull because the checkout has local changes."
+fi
+
+if is_ready "$API_STATUS_URL" && is_ready "$FRONTEND_STATUS_URL"; then
+  log "Services already healthy; opening Chrome."
+  open_archive
+  exit 0
 fi
 
 if [[ ! -x "$ROOT_DIR/.venv/bin/python" ]]; then
