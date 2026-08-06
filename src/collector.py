@@ -5,11 +5,13 @@ import datetime
 import logging
 import time
 import spotipy
-from spotipy.oauth2 import SpotifyOAuth
+from dotenv import load_dotenv
+from spotipy.oauth2 import SpotifyOAuth, SpotifyPKCE
 from spotipy.exceptions import SpotifyException
 from requests.exceptions import RequestException
 
 # determine monthly DB path
+load_dotenv()
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -72,12 +74,17 @@ if "genre" not in cols:
     conn.execute("ALTER TABLE plays ADD COLUMN genre TEXT")
     logger.info("Added missing 'genre' column")
 
-oauth = SpotifyOAuth(
-    client_id=os.getenv("SPOTIFY_CLIENT_ID"),
-    client_secret=os.getenv("SPOTIFY_CLIENT_SECRET"),
-    redirect_uri="http://127.0.0.1:8888/callback",
-    scope="user-read-recently-played",
-    cache_path="/tmp/.spotify-cache",
+auth_kwargs = {
+    "client_id": os.getenv("SPOTIFY_CLIENT_ID"),
+    "redirect_uri": "http://127.0.0.1:8888/callback",
+    "scope": "user-read-recently-played",
+    "cache_path": "/tmp/.spotify-cache",
+}
+client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+oauth = (
+    SpotifyOAuth(client_secret=client_secret, **auth_kwargs)
+    if client_secret
+    else SpotifyPKCE(**auth_kwargs)
 )
 token = retry_with_backoff(oauth.refresh_access_token, os.getenv("SPOTIFY_REFRESH_TOKEN"))
 logger.info("Refreshed access token")
