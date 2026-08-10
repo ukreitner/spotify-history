@@ -44,9 +44,11 @@ class TestResult:
     max_coherence: float = 0.0
     
     # Flow quality
-    avg_transition_cost: float = 0.0
-    smooth_transitions: int = 0
-    jarring_transitions: int = 0
+    avg_transition_cost: Optional[float] = None
+    smooth_transitions: Optional[int] = None
+    jarring_transitions: Optional[int] = None
+    measured_transitions: int = 0
+    total_transitions: int = 0
     
     # Diversity
     unique_artists: int = 0
@@ -130,9 +132,11 @@ def analyze_result(name: str, anchors: List[Dict], settings: Dict, result: Dict)
         test.max_coherence = max(coherences)
     
     # Flow quality
-    test.avg_transition_cost = flow_stats.get("avg_transition_cost", 0)
-    test.smooth_transitions = flow_stats.get("smooth_transitions", 0)
-    test.jarring_transitions = flow_stats.get("jarring_transitions", 0)
+    test.avg_transition_cost = flow_stats.get("avg_transition_cost")
+    test.smooth_transitions = flow_stats.get("smooth_transitions")
+    test.jarring_transitions = flow_stats.get("jarring_transitions")
+    test.measured_transitions = flow_stats.get("measured_transitions", 0)
+    test.total_transitions = flow_stats.get("total_transitions", max(0, len(tracks) - 1))
     
     # Artist diversity
     artists = [t.get("artist", "").split(",")[0].strip() for t in tracks]
@@ -194,10 +198,25 @@ def print_test_result(test: TestResult):
     print(f"   Grade: {coherence_grade}")
     
     print(f"\n🌊 FLOW QUALITY:")
-    print(f"   Avg transition cost: {test.avg_transition_cost:.3f}")
-    print(f"   Smooth: {test.smooth_transitions} | Jarring: {test.jarring_transitions}")
-    flow_grade = "🟢 Smooth" if test.jarring_transitions == 0 else "🟡 OK" if test.jarring_transitions <= 2 else "🔴 Choppy"
-    print(f"   Grade: {flow_grade}")
+    if test.avg_transition_cost is None:
+        print(
+            "   Audio smoothness not measured "
+            f"({test.measured_transitions}/{test.total_transitions} hops have audio data)"
+        )
+    else:
+        print(f"   Avg transition cost: {test.avg_transition_cost:.3f}")
+        print(f"   Smooth: {test.smooth_transitions} | Jarring: {test.jarring_transitions}")
+        print(
+            "   Grade: "
+            + (
+                "🟢 Smooth"
+                if test.jarring_transitions == 0
+                else "🟡 OK"
+                if test.jarring_transitions <= 2
+                else "🔴 Choppy"
+            )
+            + f" ({test.measured_transitions}/{test.total_transitions} measured hops)"
+        )
     
     print(f"\n👥 ARTIST DIVERSITY:")
     print(f"   Unique artists: {test.unique_artists} / {test.total_tracks} tracks")
@@ -426,12 +445,20 @@ def main():
         # Aggregate metrics
         avg_coherence = statistics.mean(r.avg_coherence for r in successful)
         avg_diversity = statistics.mean(r.unique_artists / r.total_tracks for r in successful if r.total_tracks > 0)
-        avg_jarring = statistics.mean(r.jarring_transitions for r in successful)
+        measured_flow_results = [
+            r for r in successful if r.jarring_transitions is not None
+        ]
         
         print(f"\n📈 Aggregate Metrics (successful tests):")
         print(f"   Avg Coherence Score: {avg_coherence:.3f}")
         print(f"   Avg Artist Diversity: {avg_diversity:.1%}")
-        print(f"   Avg Jarring Transitions: {avg_jarring:.1f}")
+        if measured_flow_results:
+            avg_jarring = statistics.mean(
+                r.jarring_transitions for r in measured_flow_results
+            )
+            print(f"   Avg Jarring Transitions (measured runs): {avg_jarring:.1f}")
+        else:
+            print("   Audio transition quality was not measurable in these runs")
         
         # Best and worst
         best_coherence = max(successful, key=lambda r: r.avg_coherence)
@@ -486,4 +513,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

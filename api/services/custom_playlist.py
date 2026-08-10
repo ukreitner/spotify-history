@@ -5,6 +5,7 @@ from functools import lru_cache
 import random
 import math
 import re
+import time
 import unicodedata
 from ..db import (
     get_all_tracks_with_counts, get_top_artists, get_top_genres, query_all_dbs,
@@ -538,6 +539,29 @@ def _track_key(artist: str, title: str) -> Tuple[str, str]:
     return (_normalize_music_text(artist), _normalize_music_text(title))
 
 
+def _is_explicit_low_value_variant(title: str) -> bool:
+    """Identify narrow, explicit catalog variants from title qualifiers.
+
+    This intentionally does not guess whether an ordinary recording is a
+    cover.  It only rejects discovery titles that label themselves as the
+    common low-value speed/karaoke/tribute variants.
+    """
+    raw = (title or "").replace("–", "-").replace("—", "-")
+    text = unicodedata.normalize("NFKD", raw).encode(
+        "ascii", "ignore"
+    ).decode().casefold()
+    return bool(re.search(
+        r"(?:[-–—]|\(|\[)\s*(?:"
+        r"sped\s*up(?:\s+version)?|"
+        r"slowed(?:\s+down)?(?:\s*(?:and|\+)\s*reverb)?|"
+        r"nightcore(?:\s+version)?|"
+        r"karaoke(?:\s+version)?|"
+        r"(?:a\s+)?tribute(?:\s+to)?"
+        r")\b",
+        text,
+    ))
+
+
 def _spotify_track_matches(track: Dict, artist: str, title: str) -> bool:
     """Require the requested artist and title instead of trusting search rank."""
     artist_key, title_key = _track_key(artist, title)
@@ -597,6 +621,75 @@ def _artist_names(track: Dict) -> List[str]:
 def _candidate_artist_key(candidate: Dict) -> str:
     names = _artist_names(candidate.get("track", {}))
     return _normalize_music_text(names[0] if names else "")
+
+
+def _candidate_artist_keys(candidate: Dict) -> Tuple[str, ...]:
+    """Return every credited artist once, in Spotify credit order."""
+    return tuple(dict.fromkeys(
+        key
+        for key in (
+            _normalize_music_text(name)
+            for name in _artist_names(candidate.get("track", {}))
+        )
+        if key
+    ))
+
+
+_EVIDENCE_PRIORITY = {
+    "artist": 1,
+    "anchor_artist": 2,
+    "track": 3,
+    "anchor": 4,
+}
+
+
+def _calibrated_relation(
+    evidence_type: str,
+    rank: int = 0,
+    total: int = 1,
+    raw_match: float = 0.0,
+) -> float:
+    """Put heterogeneous Last.fm evidence on a useful 0-1 scale.
+
+    Strong direct track matches sit above artist-neighbour fallbacks, while
+    weak raw matches are allowed to fall below them.  This keeps Last.fm's
+    occasional low-confidence plateaus from masquerading as authoritative
+    evidence and makes the public coherence threshold meaningful.
+    """
+    if evidence_type == "anchor":
+        return 1.0
+    if evidence_type == "anchor_artist":
+        return 0.82
+
+    denominator = max(total - 1, 1)
+    rank_score = max(0.0, min(1.0, 1 - rank / denominator))
+    match_score = max(0.0, min(1.0, float(raw_match or 0.0)))
+    if evidence_type == "track":
+        # Last.fm sometimes returns one strong neighbour followed by a long,
+        # numerically identical low-confidence plateau.  A large fixed floor
+        # made every item on that plateau look authoritative (and rank then
+        # dominated the actual match value).  Keep excellent direct matches
+        # excellent, while requiring the raw relation to do most of the work.
+        return min(1.0, 0.20 + 0.70 * match_score + 0.10 * rank_score)
+    # Artist-neighbour evidence is broader than a strong track edge, but it is
+    # still a real Last.fm relationship.  Let roughly the well-ranked half of
+    # a healthy artist graph clear the default .50 strictness; the previous
+    # .58 ceiling admitted only the first few artists, which were commonly
+    # already exhausted by familiar-track caps.
+    return min(0.70, 0.38 + 0.20 * rank_score + 0.12 * match_score)
+
+
+def _calibrated_affinity(
+    relation: float,
+    popularity: Optional[int],
+    play_count: int = 0,
+) -> float:
+    familiarity = min(1.0, math.log1p(max(play_count, 0)) / math.log(12))
+    popularity_score = score_popularity_balance(popularity)
+    return max(
+        0.0,
+        min(1.0, 0.90 * relation + 0.06 * familiarity + 0.04 * popularity_score),
+    )
 
 
 def _generate_vibe_playlist_legacy(
@@ -1011,90 +1104,233 @@ def generate_vibe_playlist(
     max_per_anchor_artist: int = 3,
     max_per_similar_artist: int = 2,
 ) -> Dict:
-    """Generate a playlist backed by exact Last.fm similarity evidence.
+    """Generate a fair, evidence-backed blend of several anchor tracks.
 
-    Spotify no longer exposes recommendations, related artists, or audio
-    features to many development-mode apps. The former fallback treated broad
-    genre substrings as evidence (for example, ``pop`` matching ``baroque
-    pop``), which admitted unrelated tracks. This implementation uses exact
-    artist/title matches from Last.fm's similarity graph and validates every
-    result against Spotify before returning it.
+    Every candidate keeps a calibrated affinity to every anchor that produced
+    it. Pool construction and final selection are both balanced by anchor, so
+    an anchor with a larger or easier-to-resolve Last.fm neighbourhood cannot
+    silently turn a multi-anchor request into a single-artist radio station.
     """
     exclude_keys = {_normalize_music_text(name) for name in (exclude_artists or [])}
     if not anchor_track_ids or len(anchor_track_ids) > 5:
         raise ValueError("Need 1-5 anchor tracks")
+    if len(set(anchor_track_ids)) != len(anchor_track_ids):
+        raise ValueError("Anchor track IDs must be unique")
+    if not 10 <= track_count <= 100:
+        raise ValueError("track_count must be between 10 and 100")
+    if not 0 <= discovery_ratio <= 100:
+        raise ValueError("discovery_ratio must be between 0 and 100")
+    if not 0 <= coherence_threshold <= 1:
+        raise ValueError("coherence_threshold must be between 0 and 1")
+    if not 0 <= max_per_anchor_artist <= 10:
+        raise ValueError("max_per_anchor_artist must be between 0 and 10")
+    if not 1 <= max_per_similar_artist <= 10:
+        raise ValueError("max_per_similar_artist must be between 1 and 10")
 
-    anchor_tracks = get_tracks_bulk(anchor_track_ids)
-    anchor_map = {track.get("id"): track for track in anchor_tracks if track}
-    anchor_tracks = [anchor_map[track_id] for track_id in anchor_track_ids if track_id in anchor_map]
-    if not anchor_tracks:
-        raise ValueError("Could not fetch anchor tracks")
+    distinct_anchor_ids = list(dict.fromkeys(anchor_track_ids))
+    fetched_anchors = get_tracks_bulk(distinct_anchor_ids)
+    fetched_anchor_map = {
+        track.get("id"): track for track in fetched_anchors if track and track.get("id")
+    }
+    anchor_tracks = [
+        fetched_anchor_map[track_id]
+        for track_id in distinct_anchor_ids
+        if track_id in fetched_anchor_map
+    ]
+    missing_anchor_ids = [
+        track_id for track_id in distinct_anchor_ids
+        if track_id not in fetched_anchor_map
+    ]
+    if missing_anchor_ids:
+        raise ValueError(
+            "Could not fetch every requested anchor track "
+            f"({len(missing_anchor_ids)} missing)"
+        )
 
-    anchor_pairs: List[Tuple[str, str]] = []
-    anchor_artist_keys: Set[str] = set()
+    anchor_specs: List[Dict] = []
     for track in anchor_tracks:
-        title = track.get("name", "")
-        for artist in _artist_names(track)[:1]:
-            anchor_pairs.append((artist, title))
-            anchor_artist_keys.add(_normalize_music_text(artist))
-
-    # Build the artist neighborhood. Rank is used alongside Last.fm's match
-    # value because match magnitudes vary dramatically between artists.
-    artist_evidence: Dict[str, Dict] = {}
-    for anchor_name, _ in anchor_pairs:
-        similar = get_similar_artists(anchor_name, limit=40)
-        total = max(len(similar) - 1, 1)
-        for rank, item in enumerate(similar):
-            name = item.get("name", "").strip()
-            key = _normalize_music_text(name)
-            if not key or key in exclude_keys:
+        artist_names = _artist_names(track)
+        anchor_specs.append({
+            "id": track["id"],
+            "track": track,
+            "title": track.get("name", ""),
+            "artists": artist_names,
+            "primary_artist": artist_names[0] if artist_names else "Unknown artist",
+        })
+    anchor_ids = [spec["id"] for spec in anchor_specs]
+    anchor_by_id = {spec["id"]: spec for spec in anchor_specs}
+    stable_anchor_ids = sorted(anchor_ids)
+    anchor_artist_keys = {
+        _normalize_music_text(artist)
+        for spec in anchor_specs
+        for artist in spec["artists"]
+    }
+    anchor_artist_anchors: Dict[str, Set[str]] = {}
+    anchor_artist_catalog: Dict[str, Dict] = {}
+    for spec in anchor_specs:
+        for artist in spec["track"].get("artists", []):
+            artist_key = _normalize_music_text(artist.get("name", ""))
+            if not artist_key:
                 continue
-            rank_score = 1 - rank / total
-            raw_match = min(1.0, float(item.get("match", 0) or 0))
-            relation = min(0.98, 0.68 + 0.20 * rank_score + 0.10 * raw_match)
-            current = artist_evidence.get(key)
-            if current is None or relation > current["score"]:
-                artist_evidence[key] = {
-                    "name": name,
-                    "score": relation,
-                    "anchor": anchor_name,
-                    "rank": rank,
-                }
+            anchor_artist_anchors.setdefault(artist_key, set()).add(spec["id"])
+            # Spotify artist IDs let us seed the actual catalog for every
+            # credited artist, including a secondary credit that Last.fm may
+            # return no track-neighbourhood for at all.
+            if artist.get("id"):
+                anchor_artist_catalog.setdefault(artist_key, artist)
+    excluded_anchor_artists = sorted(anchor_artist_keys & exclude_keys)
+    if excluded_anchor_artists:
+        raise ValueError(
+            "An excluded artist is also used by an anchor track; remove the "
+            "artist from exclusions or remove that anchor"
+        )
 
-    for anchor_name, _ in anchor_pairs:
-        artist_evidence[_normalize_music_text(anchor_name)] = {
-            "name": anchor_name,
-            "score": 1.0,
-            "anchor": anchor_name,
-            "rank": -1,
+    # Evidence maps retain all anchors instead of keeping only the maximum.
+    artist_evidence: Dict[str, Dict[str, Dict]] = {}
+    artist_display_names: Dict[str, str] = {}
+    track_evidence: Dict[Tuple[str, str], Dict[str, Dict]] = {}
+    track_metadata: Dict[Tuple[str, str], Tuple[str, str]] = {}
+
+    def put_evidence(
+        store: Dict,
+        key,
+        anchor_id: str,
+        relation: float,
+        evidence_type: str,
+        rank: int,
+        raw_match: Optional[float] = None,
+    ) -> None:
+        by_anchor = store.setdefault(key, {})
+        current = by_anchor.get(anchor_id)
+        incoming = {
+            "relation": relation,
+            "type": evidence_type,
+            "rank": rank,
+            "raw_match": raw_match,
         }
+        if current is None or (
+            relation, _EVIDENCE_PRIORITY[evidence_type]
+        ) > (
+            current["relation"], _EVIDENCE_PRIORITY[current["type"]]
+        ):
+            by_anchor[anchor_id] = incoming
 
-    similar_tracks_by_anchor = get_similar_tracks_batch(
-        anchor_pairs,
+    track_query_anchors: Dict[Tuple[str, str], List[str]] = {}
+    for spec in anchor_specs:
+        for artist_name in spec["artists"]:
+            artist_key = _normalize_music_text(artist_name)
+            artist_display_names.setdefault(artist_key, artist_name)
+            put_evidence(
+                artist_evidence,
+                artist_key,
+                spec["id"],
+                _calibrated_relation("anchor_artist"),
+                "anchor_artist",
+                -1,
+            )
+            similar = get_similar_artists(artist_name, limit=40)
+            for rank, item in enumerate(similar):
+                name = item.get("name", "").strip()
+                key = _normalize_music_text(name)
+                if not key or key in exclude_keys:
+                    continue
+                artist_display_names.setdefault(key, name)
+                put_evidence(
+                    artist_evidence,
+                    key,
+                    spec["id"],
+                    _calibrated_relation(
+                        "artist", rank, len(similar), item.get("match", 0)
+                    ),
+                    "artist",
+                    rank,
+                )
+
+            pair = (artist_name, spec["title"])
+            track_query_anchors.setdefault(pair, []).append(spec["id"])
+
+    similar_tracks_by_query = get_similar_tracks_batch(
+        list(track_query_anchors),
         limit=60,
-        max_workers=min(5, len(anchor_pairs)),
+        max_workers=min(6, len(track_query_anchors)),
     )
-    track_evidence: Dict[Tuple[str, str], Dict] = {}
-    for pair, similar_tracks in similar_tracks_by_anchor.items():
-        anchor_name, _ = pair
-        total = max(len(similar_tracks) - 1, 1)
+    for query, similar_tracks in similar_tracks_by_query.items():
         for rank, item in enumerate(similar_tracks):
             artist = item.get("artist", "").strip()
             title = item.get("name", "").strip()
             key = _track_key(artist, title)
             if not all(key) or key[0] in exclude_keys:
                 continue
-            rank_score = 1 - rank / total
-            relation = min(0.99, 0.72 + 0.25 * rank_score)
-            current = track_evidence.get(key)
-            if current is None or relation > current["score"]:
-                track_evidence[key] = {
-                    "artist": artist,
-                    "title": title,
-                    "score": relation,
-                    "anchor": anchor_name,
-                    "rank": rank,
-                }
+            track_metadata.setdefault(key, (artist, title))
+            for anchor_id in track_query_anchors.get(query, []):
+                put_evidence(
+                    track_evidence,
+                    key,
+                    anchor_id,
+                    _calibrated_relation(
+                        "track", rank, len(similar_tracks), item.get("match", 0)
+                    ),
+                    "track",
+                    rank,
+                    float(item.get("match", 0) or 0),
+                )
+
+    def evidence_for_names(
+        artist_names: List[str],
+        title: str,
+        popularity: Optional[int],
+        play_count: int,
+    ) -> Tuple[
+        Dict[str, float],
+        Dict[str, str],
+        Dict[str, float],
+        Dict[str, float],
+    ]:
+        best: Dict[str, Dict] = {}
+        artist_support_affinities: Dict[str, float] = {}
+
+        def consider(by_anchor: Dict[str, Dict]) -> None:
+            for anchor_id, evidence in by_anchor.items():
+                current = best.get(anchor_id)
+                if current is None or (
+                    evidence["relation"], _EVIDENCE_PRIORITY[evidence["type"]]
+                ) > (
+                    current["relation"], _EVIDENCE_PRIORITY[current["type"]]
+                ):
+                    best[anchor_id] = evidence
+
+        for artist_name in artist_names:
+            by_artist = artist_evidence.get(_normalize_music_text(artist_name), {})
+            for anchor_id, evidence in by_artist.items():
+                artist_support_affinities[anchor_id] = max(
+                    artist_support_affinities.get(anchor_id, 0),
+                    _calibrated_affinity(
+                        evidence["relation"], popularity, play_count
+                    ),
+                )
+            consider(by_artist)
+            consider(track_evidence.get(_track_key(artist_name, title), {}))
+
+        affinities = {
+            anchor_id: _calibrated_affinity(
+                evidence["relation"], popularity, play_count
+            )
+            for anchor_id, evidence in best.items()
+        }
+        evidence_types = {
+            anchor_id: evidence["type"] for anchor_id, evidence in best.items()
+        }
+        raw_matches = {
+            anchor_id: evidence["raw_match"]
+            for anchor_id, evidence in best.items()
+            if evidence.get("raw_match") is not None
+        }
+        return (
+            affinities,
+            evidence_types,
+            raw_matches,
+            artist_support_affinities,
+        )
 
     all_history = get_all_tracks_with_counts("music")
     known_track_ids = set(all_history)
@@ -1102,288 +1338,1483 @@ def generate_vibe_playlist(
         _track_key(_primary_artist_name(row.get("artist", "")), row.get("track", ""))
         for row in all_history.values()
     }
-    desired_discovery = int(track_count * discovery_ratio / 100)
-    desired_history = track_count - desired_discovery
-
-    # Fetch anchor genres for the UI's vibe summary. Similarity-neighborhood
-    # tags are kept separately and only used as a flow fallback.
-    anchor_artist_ids = {
-        artist.get("id")
-        for track in anchor_tracks
-        for artist in track.get("artists", [])
-        if artist.get("id")
-    }
-    anchor_artists = get_artists_bulk(list(anchor_artist_ids))
-    anchor_genres: List[str] = []
-    for artist in anchor_artists:
-        for genre in artist.get("genres", []):
-            if genre not in anchor_genres:
-                anchor_genres.append(genre)
+    requested_discovery = int(track_count * discovery_ratio / 100)
+    requested_history = track_count - requested_discovery
+    warnings: List[str] = []
 
     candidates: List[Dict] = []
-    seen_candidate_ids: Set[str] = set()
-    seen_candidate_keys: Set[Tuple[str, str]] = set()
+    candidate_by_id: Dict[str, Dict] = {}
+    candidate_by_key: Dict[Tuple[str, str], Dict] = {}
 
     def add_candidate(
         track: Dict,
         source: str,
-        relation: float,
-        anchor_name: str,
-        via: Optional[str],
         play_count: int = 0,
-        is_anchor: bool = False,
+        anchor_id: Optional[str] = None,
+        origin_track_key: Optional[Tuple[str, str]] = None,
     ) -> bool:
         track_id = track.get("id")
-        if not track_id or track_id in seen_candidate_ids:
+        artist_names = _artist_names(track)
+        if not track_id or not artist_names:
             return False
-        names = _artist_names(track)
-        artist_keys = {_normalize_music_text(name) for name in names}
-        if artist_keys & exclude_keys:
+        if (
+            source == "discovery"
+            and anchor_id is None
+            and _is_explicit_low_value_variant(track.get("name", ""))
+        ):
             return False
-        semantic_key = _track_key(names[0] if names else "", track.get("name", ""))
-        if semantic_key in seen_candidate_keys:
+        if {
+            _normalize_music_text(name) for name in artist_names
+        } & exclude_keys:
+            return False
+        semantic_key = _track_key(artist_names[0], track.get("name", ""))
+        (
+            affinities,
+            evidence_types,
+            raw_matches,
+            artist_support_affinities,
+        ) = evidence_for_names(
+            artist_names,
+            track.get("name", ""),
+            track.get("popularity"),
+            play_count,
+        )
+        # Spotify may append a remaster/live suffix that our exact resolver
+        # intentionally accepts. Preserve the Last.fm key that led to that
+        # catalog match instead of recomputing evidence from the altered title.
+        if origin_track_key:
+            for related_anchor_id, evidence in track_evidence.get(
+                origin_track_key, {}
+            ).items():
+                score = _calibrated_affinity(
+                    evidence["relation"], track.get("popularity"), play_count
+                )
+                current_type = evidence_types.get(related_anchor_id, "artist")
+                if related_anchor_id not in affinities or (
+                    score, _EVIDENCE_PRIORITY[evidence["type"]]
+                ) > (
+                    affinities.get(related_anchor_id, 0),
+                    _EVIDENCE_PRIORITY[current_type],
+                ):
+                    affinities[related_anchor_id] = score
+                    evidence_types[related_anchor_id] = evidence["type"]
+                    if evidence.get("raw_match") is not None:
+                        raw_matches[related_anchor_id] = evidence["raw_match"]
+        if anchor_id:
+            affinities[anchor_id] = 1.0
+            evidence_types[anchor_id] = "anchor"
+        if not affinities:
             return False
 
-        popularity_score = score_popularity_balance(track.get("popularity"))
-        familiarity = min(1.0, math.log1p(max(play_count, 0)) / math.log(12))
-        coherence = min(
-            1.0,
-            0.58 + 0.32 * relation + 0.06 * familiarity + 0.04 * popularity_score,
-        )
-        candidates.append({
+        # Distinct requested anchors are mandatory even when Spotify exposes
+        # two IDs for the same normalized artist/title (for example clean and
+        # explicit catalog variants). Semantic dedupe still applies to every
+        # non-anchor candidate.
+        existing = candidate_by_id.get(track_id)
+        if not anchor_id:
+            existing = existing or candidate_by_key.get(semantic_key)
+        if existing:
+            changed = False
+            for related_anchor_id, score in affinities.items():
+                old_type = existing["evidence_types"].get(related_anchor_id, "artist")
+                new_type = evidence_types[related_anchor_id]
+                if (
+                    score, _EVIDENCE_PRIORITY[new_type]
+                ) > (
+                    existing["anchor_affinities"].get(related_anchor_id, 0),
+                    _EVIDENCE_PRIORITY[old_type],
+                ):
+                    existing["anchor_affinities"][related_anchor_id] = score
+                    existing["evidence_types"][related_anchor_id] = new_type
+                    if related_anchor_id in raw_matches:
+                        existing["raw_matches"][related_anchor_id] = raw_matches[
+                            related_anchor_id
+                        ]
+                    changed = True
+            for related_anchor_id, score in artist_support_affinities.items():
+                existing["artist_support_affinities"][related_anchor_id] = max(
+                    existing["artist_support_affinities"].get(
+                        related_anchor_id, 0
+                    ),
+                    score,
+                )
+            if changed:
+                existing["coherence_score"] = max(existing["anchor_affinities"].values())
+            return False
+
+        candidate = {
             "track": track,
             "features": {},
-            "genres": {f"similarity:{_normalize_music_text(anchor_name)}"},
+            "genres": set(),
             "source": source,
-            "via": via,
             "play_count": play_count,
-            "coherence_score": coherence,
-            "relation_score": relation,
-            "is_anchor": is_anchor,
-        })
-        seen_candidate_ids.add(track_id)
-        seen_candidate_keys.add(semantic_key)
+            "anchor_affinities": affinities,
+            "evidence_types": evidence_types,
+            "raw_matches": raw_matches,
+            "artist_support_affinities": dict(artist_support_affinities),
+            "coherence_score": max(affinities.values()),
+            "is_anchor": anchor_id is not None,
+        }
+        candidates.append(candidate)
+        candidate_by_id[track_id] = candidate
+        candidate_by_key.setdefault(semantic_key, candidate)
         return True
 
-    # Anchors are included exactly once: a seed should visibly ground the mix.
-    for track in anchor_tracks:
-        anchor_name = _artist_names(track)[0] if _artist_names(track) else "anchor"
-        history_row = all_history.get(track.get("id"), {})
+    # Anchors are mandatory and retain their own identity even if their
+    # neighbourhood overlaps another seed.
+    for spec in anchor_specs:
+        history_row = all_history.get(spec["id"], {})
         add_candidate(
-            track,
-            source="history",
-            relation=1.0,
-            anchor_name=anchor_name,
-            via="anchor",
-            play_count=int(history_row.get("play_count", 0) or 0),
-            is_anchor=True,
+            spec["track"],
+            "history",
+            int(history_row.get("play_count", 0) or 0),
+            anchor_id=spec["id"],
         )
 
-    # Familiar candidates must be by the anchor or an explicitly similar
-    # artist, or be an exact track-level Last.fm match. Filter the 11k-track
-    # archive before making any Spotify requests so selection is not biased by
-    # arbitrary database insertion order.
-    history_ranked: List[Tuple[float, int, str, Dict]] = []
+    # Pre-rank archive rows separately for every anchor before the bounded
+    # Spotify metadata fetch. This avoids global truncation by a large anchor.
+    history_entries: List[Dict] = []
     for track_id, row in all_history.items():
-        if not track_id or track_id in seen_candidate_ids:
+        if not track_id or track_id in candidate_by_id:
             continue
-        artist_name = _primary_artist_name(row.get("artist", ""))
-        artist_key = _normalize_music_text(artist_name)
-        if not artist_key or artist_key in exclude_keys:
+        artist_names = [
+            name.strip() for name in row.get("artist", "").split(",")
+            if name.strip()
+        ]
+        if not artist_names or {
+            _normalize_music_text(name) for name in artist_names
+        } & exclude_keys:
             continue
-        evidence = artist_evidence.get(artist_key)
-        track_match = track_evidence.get(_track_key(artist_name, row.get("track", "")))
-        if not evidence and not track_match:
-            continue
-        relation = max(
-            evidence["score"] if evidence else 0,
-            track_match["score"] if track_match else 0,
+        play_count = int(row.get("play_count", 0) or 0)
+        (
+            affinities,
+            evidence_types,
+            raw_matches,
+            artist_support_affinities,
+        ) = evidence_for_names(
+            artist_names, row.get("track", ""), None, play_count
         )
-        anchor_name = (
-            track_match["anchor"] if track_match
-            else evidence["anchor"] if evidence
-            else anchor_pairs[0][0]
-        )
-        history_ranked.append((
-            relation,
-            int(row.get("play_count", 0) or 0),
-            anchor_name,
-            row,
-        ))
-
-    history_ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    history_lookup = {item[3]["track_id"]: item for item in history_ranked}
-    history_fetch_ids = [
-        item[3]["track_id"]
-        for item in history_ranked[: max(100, desired_history * 10)]
-    ]
-    for track in get_tracks_bulk(history_fetch_ids):
-        item = history_lookup.get(track.get("id"))
-        if not item:
+        if not affinities:
             continue
-        relation, play_count, anchor_name, _ = item
-        add_candidate(
-            track,
-            source="history",
-            relation=relation,
-            anchor_name=anchor_name,
-            via=f"familiar · similar to {anchor_name}",
-            play_count=play_count,
-        )
+        history_entries.append({
+            "track_id": track_id,
+            "row": row,
+            "play_count": play_count,
+            "affinities": affinities,
+            "evidence_types": evidence_types,
+            "raw_matches": raw_matches,
+            "artist_support_affinities": artist_support_affinities,
+        })
 
-    # Prefer exact similar tracks for discovery. Resolve a bounded set in
-    # parallel, then validate artist and title to reject search impostors.
-    ranked_track_evidence = sorted(
-        track_evidence.values(),
-        key=lambda item: (item["score"], -item["rank"]),
-        reverse=True,
-    )
-    resolve_limit = max(24, min(60, desired_discovery * 3))
-    exact_results: List[Tuple[Dict, Optional[Dict]]] = []
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        future_map = {
-            executor.submit(_resolve_spotify_track, item["artist"], item["title"]): item
-            for item in ranked_track_evidence[:resolve_limit]
-        }
-        for future in as_completed(future_map):
-            item = future_map[future]
-            try:
-                exact_results.append((item, future.result()))
-            except Exception:
-                continue
-
-    exact_results.sort(key=lambda pair: (pair[0]["score"], -pair[0]["rank"]), reverse=True)
-    for evidence, track in exact_results:
-        if not track or track.get("id") in known_track_ids:
-            continue
-        names = _artist_names(track)
-        if _track_key(names[0] if names else "", track.get("name", "")) in known_track_keys:
-            continue
-        add_candidate(
-            track,
-            source="discovery",
-            relation=evidence["score"],
-            anchor_name=evidence["anchor"],
-            via=f"track match · {evidence['anchor']}",
-        )
-
-    # Fill any remaining discovery pool from top tracks by validated similar
-    # artists. Artist-name equality is mandatory; a top search result alone is
-    # not evidence that Spotify resolved the intended artist.
-    discovery_pool_size = sum(1 for candidate in candidates if candidate["source"] == "discovery")
-    discovery_pool_target = max(desired_discovery + 8, math.ceil(desired_discovery * 1.5))
-    if discovery_pool_size < discovery_pool_target:
-        for artist_key, evidence in sorted(
-            artist_evidence.items(),
-            key=lambda item: item[1]["score"],
+    history_fetch_budget = max(100, requested_history * 10)
+    history_queues = {
+        anchor_id: sorted(
+            [
+                entry for entry in history_entries
+                if anchor_id in entry["affinities"]
+                # Spotify popularity can add up to .02 over the neutral
+                # pre-fetch estimate. Keep borderline archive rows until the
+                # enriched score can be checked exactly.
+                and entry["affinities"][anchor_id] + 0.02
+                >= coherence_threshold
+            ],
+            key=lambda entry: (
+                entry["affinities"][anchor_id],
+                _EVIDENCE_PRIORITY[entry["evidence_types"][anchor_id]],
+                entry["play_count"],
+                entry["track_id"],
+            ),
             reverse=True,
+        )
+        for anchor_id in anchor_ids
+    }
+    history_fetch_ids: List[str] = []
+    fetched_history_ids: Set[str] = set()
+    history_positions = {anchor_id: 0 for anchor_id in anchor_ids}
+    while len(history_fetch_ids) < history_fetch_budget:
+        progress = False
+        for related_anchor_id in stable_anchor_ids:
+            queue = history_queues[related_anchor_id]
+            position = history_positions[related_anchor_id]
+            while position < len(queue) and queue[position]["track_id"] in fetched_history_ids:
+                position += 1
+            history_positions[related_anchor_id] = position
+            if position >= len(queue):
+                continue
+            track_id = queue[position]["track_id"]
+            history_positions[related_anchor_id] += 1
+            fetched_history_ids.add(track_id)
+            history_fetch_ids.append(track_id)
+            progress = True
+            if len(history_fetch_ids) >= history_fetch_budget:
+                break
+        if not progress:
+            break
+
+    history_row_by_id = {entry["track_id"]: entry for entry in history_entries}
+    for track in get_tracks_bulk(history_fetch_ids):
+        entry = history_row_by_id.get(track.get("id"))
+        if entry:
+            add_candidate(track, "history", entry["play_count"])
+
+    # Seed the real catalog for *every* credited anchor artist.  Last.fm may
+    # have no track-neighbourhood for a secondary credit (the live failure was
+    # Giant Rooks on a jointly credited anchor), so artist evidence alone is
+    # not enough: without an explicit catalog fetch there is nothing for the
+    # selector to represent.
+    anchor_catalog_candidate_ids: Dict[str, Set[str]] = {
+        artist_key: set() for artist_key in anchor_artist_catalog
+    }
+    catalog_results: List[Tuple[str, List[Dict]]] = []
+    if anchor_artist_catalog:
+        with ThreadPoolExecutor(
+            max_workers=min(6, len(anchor_artist_catalog))
+        ) as executor:
+            future_map = {
+                executor.submit(
+                    get_artist_top_tracks,
+                    artist.get("id"),
+                    market="CH",
+                ): artist_key
+                for artist_key, artist in anchor_artist_catalog.items()
+            }
+            for future in as_completed(future_map):
+                artist_key = future_map[future]
+                try:
+                    catalog_results.append((artist_key, future.result() or []))
+                except Exception:
+                    catalog_results.append((artist_key, []))
+
+    for artist_key, top_tracks in sorted(catalog_results):
+        for track in top_tracks[:5]:
+            if not track or not track.get("id"):
+                continue
+            track_id = track["id"]
+            history_row = all_history.get(track_id, {})
+            source = "history" if track_id in known_track_ids else "discovery"
+            add_candidate(
+                track,
+                source,
+                int(history_row.get("play_count", 0) or 0),
+            )
+            names = _artist_names(track)
+            semantic_key = _track_key(
+                names[0] if names else "", track.get("name", "")
+            )
+            retained = candidate_by_id.get(track_id) or candidate_by_key.get(
+                semantic_key
+            )
+            if retained and artist_key in _candidate_artist_keys(retained):
+                anchor_catalog_candidate_ids[artist_key].add(
+                    retained["track"]["id"]
+                )
+
+    def artist_limit_for_key(artist_key: str) -> int:
+        return (
+            max_per_anchor_artist
+            if artist_key in anchor_artist_keys
+            else max_per_similar_artist
+        )
+
+    def fits_artist_caps(candidate: Dict, counts: Dict[str, int]) -> bool:
+        keys = _candidate_artist_keys(candidate)
+        return bool(keys) and all(
+            counts.get(key, 0) < artist_limit_for_key(key)
+            for key in keys
+        )
+
+    def count_candidate_artists(candidate: Dict, counts: Dict[str, int]) -> None:
+        for key in _candidate_artist_keys(candidate):
+            counts[key] = counts.get(key, 0) + 1
+
+    # Estimate how many requested history slots can actually survive the same
+    # threshold and artist caps used by final selection. Discovery acquisition
+    # only provisions the resulting shortfall, so a 0%-new playlist with ample
+    # history does not make dozens of unnecessary Spotify searches.
+    provisional_artist_counts: Dict[str, int] = {}
+    selectable_history_capacity = 0
+    for candidate in sorted(
+        [item for item in candidates if item["source"] == "history"],
+        key=lambda item: (item["is_anchor"], item["coherence_score"]),
+        reverse=True,
+    ):
+        artist_keys = _candidate_artist_keys(candidate)
+        if not artist_keys:
+            continue
+        if candidate["is_anchor"]:
+            selectable_history_capacity += 1
+            count_candidate_artists(candidate, provisional_artist_counts)
+            continue
+        if candidate["coherence_score"] < coherence_threshold:
+            continue
+        if not fits_artist_caps(candidate, provisional_artist_counts):
+            continue
+        selectable_history_capacity += 1
+        count_candidate_artists(candidate, provisional_artist_counts)
+        if selectable_history_capacity >= requested_history:
+            break
+
+    history_shortfall = max(0, requested_history - selectable_history_capacity)
+    remote_fill_target = requested_discovery + history_shortfall
+
+    def direct_lead_can_qualify(
+        key: Tuple[str, str],
+        related_anchor_id: str,
+    ) -> bool:
+        direct = track_evidence[key][related_anchor_id]["relation"]
+        # A weak track edge can still resolve to an artist with independently
+        # strong artist-neighbour evidence.  Include that known support in the
+        # pre-network upper bound; unknown Spotify co-credits cannot be known
+        # until resolution and are intentionally outside this cheap gate.
+        artist = artist_evidence.get(key[0], {}).get(related_anchor_id, {})
+        potential_relation = max(direct, artist.get("relation", 0))
+        return _calibrated_affinity(potential_relation, 45, 0) >= coherence_threshold
+
+    # Resolve an equal number of direct-track leads from each anchor.
+    track_queues = {
+        anchor_id: sorted(
+            [
+                key for key, by_anchor in track_evidence.items()
+                if anchor_id in by_anchor
+                # Popularity can contribute at most .04 for an unseen track.
+                # Do not spend a Spotify search on a Last.fm lead whose known
+                # relation cannot possibly clear the requested strictness.
+                and direct_lead_can_qualify(key, anchor_id)
+            ],
+            key=lambda key: (
+                track_evidence[key][anchor_id]["relation"],
+                -track_evidence[key][anchor_id]["rank"],
+                key,
+            ),
+            reverse=True,
+        )
+        for anchor_id in anchor_ids
+    }
+    seen_resolve_keys: Set[Tuple[str, str]] = set()
+    track_positions = {anchor_id: 0 for anchor_id in anchor_ids}
+    direct_attempts = 0
+    direct_resolution_truncated = False
+
+    # Grow related-artist pools round-robin until the cap-aware allocator can
+    # fill both the requested discoveries and any proven history shortfall.
+    artist_queues = {
+        anchor_id: sorted(
+            [
+                key for key, by_anchor in artist_evidence.items()
+                if anchor_id in by_anchor
+                and key not in anchor_artist_keys
+                and key not in exclude_keys
+            ],
+            key=lambda key: (
+                artist_evidence[key][anchor_id]["relation"],
+                -artist_evidence[key][anchor_id]["rank"],
+                key,
+            ),
+            reverse=True,
+        )
+        for anchor_id in anchor_ids
+    }
+    artist_positions = {anchor_id: 0 for anchor_id in anchor_ids}
+    attempted_artists: Set[str] = set()
+    max_artist_attempts = min(
+        80,
+        max(
+            20,
+            math.ceil(max(track_count - len(anchor_specs), 0) / 2)
+            + 8 * len(anchor_specs),
+        ),
+    )
+    acquisition_deadline = time.monotonic() + 45.0
+    # Reserve most of the shared acquisition budget for artist-supported
+    # paths.  A slow or unresolved direct graph must not starve them before
+    # their first request is made.
+    direct_acquisition_deadline = min(
+        acquisition_deadline,
+        time.monotonic() + 12.0,
+    )
+    max_artist_fallback_affinity = _calibrated_affinity(
+        _calibrated_relation("artist", 0, 40, 1.0),
+        45,
+        0,
+    )
+    artist_fallback_possible = (
+        coherence_threshold <= max_artist_fallback_affinity
+    )
+
+    remote_base, remote_remainder = divmod(
+        remote_fill_target, max(len(anchor_ids), 1)
+    )
+    remote_quotas = {
+        anchor_id: remote_base + (1 if index < remote_remainder else 0)
+        for index, anchor_id in enumerate(stable_anchor_ids)
+    }
+
+    # A direct Last.fm track graph is useful evidence, but it is still one
+    # retrieval path.  Soft-cap candidates supported *only* by that path at
+    # roughly half an anchor lane so an abundant graph cannot crowd out artist
+    # neighbours or credited-artist catalog tracks.  The cap is relaxed later
+    # only if the supported pool genuinely cannot fill the requested length.
+    unsupported_direct_limits = {
+        anchor_id: max(
+            1,
+            math.ceil(track_count / max(len(anchor_ids), 1) * 0.5),
+        )
+        for anchor_id in anchor_ids
+    }
+
+    def is_unsupported_direct(candidate: Dict, related_anchor_id: str) -> bool:
+        artist_support = candidate.get("artist_support_affinities", {})
+        return (
+            candidate["evidence_types"].get(related_anchor_id) == "track"
+            and (
+                related_anchor_id not in artist_support
+                or artist_support[related_anchor_id] < coherence_threshold
+            )
+        )
+
+    def allocation_key(candidate: Dict, related_anchor_id: str):
+        return (
+            not is_unsupported_direct(candidate, related_anchor_id),
+            candidate["anchor_affinities"].get(related_anchor_id, 0),
+            _EVIDENCE_PRIORITY[
+                candidate["evidence_types"].get(related_anchor_id, "artist")
+            ],
+            candidate.get("play_count", 0),
+            candidate["track"].get("id", ""),
+        )
+
+    def plan_assignments(
+        pool: List[Dict],
+        anchor_needs: Dict[str, int],
+        current_artist_counts: Dict[str, int],
+        excluded_ids: Optional[Set[str]] = None,
+        max_assignments: Optional[int] = None,
+        unsupported_counts: Optional[Dict[str, int]] = None,
+        enforce_unsupported_limits: bool = False,
+    ) -> List[Tuple[Dict, str]]:
+        """Maximum-cardinality candidate/anchor assignment via residual flow.
+
+        A real augmenting flow is important here: degree-greedy allocation can
+        consume a shared bridge for the wrong anchor even when a complete fair
+        matching exists. Primary-artist capacities are represented in the
+        network; every credited artist is checked again when the plan is
+        applied, with a re-plan if a secondary credit is already capped.
+        """
+        excluded_ids = excluded_ids or set()
+        unsupported_counts = unsupported_counts or {
+            anchor_id: 0 for anchor_id in anchor_ids
+        }
+        needs = {
+            anchor_id: max(0, int(anchor_needs.get(anchor_id, 0)))
+            for anchor_id in anchor_ids
+        }
+        flow_limit = min(
+            sum(needs.values()),
+            max_assignments if max_assignments is not None else sum(needs.values()),
+        )
+        if flow_limit <= 0:
+            return []
+
+        eligible_by_track: Dict[str, List[str]] = {}
+        candidate_by_track: Dict[str, Dict] = {}
+        for candidate in pool:
+            track_id = candidate["track"].get("id")
+            if (
+                not track_id
+                or track_id in excluded_ids
+                or not fits_artist_caps(candidate, current_artist_counts)
+            ):
+                continue
+            eligible = [
+                anchor_id for anchor_id in stable_anchor_ids
+                if needs[anchor_id] > 0
+                and anchor_id in candidate["anchor_affinities"]
+                and candidate["anchor_affinities"][anchor_id]
+                >= coherence_threshold
+            ]
+            if eligible:
+                candidate_by_track[track_id] = candidate
+                eligible_by_track[track_id] = eligible
+        if not candidate_by_track:
+            return []
+
+        option_counts = {
+            anchor_id: sum(
+                anchor_id in eligible for eligible in eligible_by_track.values()
+            )
+            for anchor_id in anchor_ids
+        }
+        ranked_track_ids = sorted(
+            candidate_by_track,
+            key=lambda track_id: (
+                max(
+                    allocation_key(candidate_by_track[track_id], anchor_id)
+                    for anchor_id in eligible_by_track[track_id]
+                ),
+                -len(eligible_by_track[track_id]),
+                track_id,
+            ),
+            reverse=True,
+        )
+
+        graph: Dict[Tuple, List[List]] = {}
+
+        def edges(node: Tuple) -> List[List]:
+            return graph.setdefault(node, [])
+
+        def add_edge(left: Tuple, right: Tuple, capacity: int) -> List:
+            forward = [right, len(edges(right)), capacity]
+            backward = [left, len(edges(left)), 0]
+            edges(left).append(forward)
+            edges(right).append(backward)
+            return forward
+
+        source = ("source",)
+        goal = ("goal",)
+        sink = ("sink",)
+        artist_tracks: Dict[str, List[str]] = {}
+        for track_id in ranked_track_ids:
+            primary_key = _candidate_artist_key(candidate_by_track[track_id])
+            artist_tracks.setdefault(primary_key, []).append(track_id)
+        track_rank = {
+            track_id: index for index, track_id in enumerate(ranked_track_ids)
+        }
+        for artist_key in sorted(
+            artist_tracks,
+            key=lambda key: (
+                min(track_rank[track_id] for track_id in artist_tracks[key]),
+                key,
+            ),
         ):
-            if artist_key in anchor_artist_keys or artist_key in exclude_keys:
+            remaining_cap = max(
+                0,
+                artist_limit_for_key(artist_key)
+                - current_artist_counts.get(artist_key, 0),
+            )
+            if remaining_cap <= 0:
                 continue
-            spotify_artist = search_artist(evidence["name"])
-            if not spotify_artist:
-                continue
-            if _normalize_music_text(spotify_artist.get("name", "")) != artist_key:
-                continue
-            for track in get_artist_top_tracks(spotify_artist.get("id"), market="CH")[:3]:
-                if track.get("id") in known_track_ids:
+            artist_node = ("artist", artist_key)
+            add_edge(source, artist_node, remaining_cap)
+            for track_id in artist_tracks[artist_key]:
+                candidate_node = ("candidate", track_id)
+                add_edge(artist_node, candidate_node, 1)
+                candidate = candidate_by_track[track_id]
+                for anchor_id in sorted(
+                    eligible_by_track[track_id],
+                    key=lambda item: (
+                        option_counts[item],
+                        -candidate["anchor_affinities"].get(item, 0),
+                        item,
+                    ),
+                ):
+                    if (
+                        enforce_unsupported_limits
+                        and is_unsupported_direct(candidate, anchor_id)
+                    ):
+                        add_edge(
+                            candidate_node,
+                            ("unsupported", anchor_id),
+                            1,
+                        )
+                    else:
+                        add_edge(candidate_node, ("anchor", anchor_id), 1)
+        if enforce_unsupported_limits:
+            for anchor_id in stable_anchor_ids:
+                remaining = max(
+                    0,
+                    unsupported_direct_limits[anchor_id]
+                    - unsupported_counts.get(anchor_id, 0),
+                )
+                if remaining:
+                    add_edge(
+                        ("unsupported", anchor_id),
+                        ("anchor", anchor_id),
+                        remaining,
+                    )
+        for anchor_id in stable_anchor_ids:
+            if needs[anchor_id] > 0:
+                add_edge(("anchor", anchor_id), goal, needs[anchor_id])
+        add_edge(goal, sink, flow_limit)
+
+        total_flow = 0
+        while total_flow < flow_limit:
+            levels = {source: 0}
+            queue = [source]
+            for node in queue:
+                for right, _, capacity in edges(node):
+                    if capacity > 0 and right not in levels:
+                        levels[right] = levels[node] + 1
+                        queue.append(right)
+            if sink not in levels:
+                break
+            positions: Dict[Tuple, int] = {}
+
+            def send(node: Tuple, amount: int) -> int:
+                if node == sink:
+                    return amount
+                edge_list = edges(node)
+                while positions.get(node, 0) < len(edge_list):
+                    index = positions.get(node, 0)
+                    right, reverse_index, capacity = edge_list[index]
+                    if capacity > 0 and levels.get(right) == levels[node] + 1:
+                        sent = send(right, min(amount, capacity))
+                        if sent:
+                            edge_list[index][2] -= sent
+                            edges(right)[reverse_index][2] += sent
+                            return sent
+                    positions[node] = index + 1
+                return 0
+
+            while total_flow < flow_limit:
+                sent = send(source, flow_limit - total_flow)
+                if not sent:
+                    break
+                total_flow += sent
+
+        assignments: List[Tuple[Dict, str]] = []
+        for track_id in ranked_track_ids:
+            candidate_node = ("candidate", track_id)
+            for right, reverse_index, capacity in edges(candidate_node):
+                if (
+                    right[:1] in (("anchor",), ("unsupported",))
+                    and capacity == 0
+                    and edges(right)[reverse_index][2] == 1
+                ):
+                    assignments.append((candidate_by_track[track_id], right[1]))
+                    break
+        assignments.sort(
+            key=lambda item: (
+                option_counts[item[1]],
+                len(eligible_by_track[item[0]["track"]["id"]]),
+                tuple(-value if isinstance(value, (int, float)) else value
+                      for value in allocation_key(item[0], item[1])[:-1]),
+                item[0]["track"]["id"],
+            )
+        )
+        return assignments
+
+    def discovery_allocation_capacity() -> Tuple[int, Dict[str, int]]:
+        """Prove distinct, cap-aware capacity with feasible shared matching."""
+        pool = [
+            candidate for candidate in candidates
+            if candidate["source"] == "discovery"
+            and candidate["coherence_score"] >= coherence_threshold
+        ]
+        used_ids: Set[str] = set()
+        blocked_ids: Set[str] = set()
+        capacity_artist_counts = dict(provisional_artist_counts)
+        capacity_by_anchor = {anchor_id: 0 for anchor_id in anchor_ids}
+        capacity_unsupported_counts = {
+            anchor_id: 0 for anchor_id in anchor_ids
+        }
+
+        def apply_capacity_plan(plan: List[Tuple[Dict, str]]) -> int:
+            added = 0
+            for candidate, anchor_id in plan:
+                track_id = candidate["track"].get("id")
+                if not track_id or track_id in used_ids:
                     continue
-                names = _artist_names(track)
-                if _track_key(names[0] if names else "", track.get("name", "")) in known_track_keys:
+                if not fits_artist_caps(candidate, capacity_artist_counts):
+                    blocked_ids.add(track_id)
+                    continue
+                used_ids.add(track_id)
+                count_candidate_artists(candidate, capacity_artist_counts)
+                capacity_by_anchor[anchor_id] += 1
+                if is_unsupported_direct(candidate, anchor_id):
+                    capacity_unsupported_counts[anchor_id] += 1
+                added += 1
+            return added
+
+        while len(used_ids) < remote_fill_target:
+            needs = {
+                anchor_id: max(
+                    0, remote_quotas[anchor_id] - capacity_by_anchor[anchor_id]
+                )
+                for anchor_id in anchor_ids
+            }
+            if not any(needs.values()):
+                break
+            plan = plan_assignments(
+                pool,
+                needs,
+                capacity_artist_counts,
+                used_ids | blocked_ids,
+                unsupported_counts=capacity_unsupported_counts,
+                enforce_unsupported_limits=True,
+            )
+            if not plan or not apply_capacity_plan(plan):
+                break
+
+        while len(used_ids) < remote_fill_target:
+            remaining = remote_fill_target - len(used_ids)
+            relaxed_needs = {anchor_id: remaining for anchor_id in anchor_ids}
+            plan = plan_assignments(
+                pool,
+                relaxed_needs,
+                capacity_artist_counts,
+                used_ids | blocked_ids,
+                max_assignments=remaining,
+                unsupported_counts=capacity_unsupported_counts,
+                enforce_unsupported_limits=True,
+            )
+            if not plan or not apply_capacity_plan(plan):
+                break
+
+        return len(used_ids), capacity_by_anchor
+
+    # Resolve direct Last.fm track leads in bounded, fair batches. Capacity is
+    # re-evaluated after every batch, so healthy catalogs stop early while a
+    # run of unresolved leads does not hide valid matches later in the queues.
+    max_direct_attempts = min(
+        300,
+        max(60, remote_fill_target * 4) if remote_fill_target else 0,
+    )
+    capacity_total, capacity_by_anchor = discovery_allocation_capacity()
+
+    def needs_more_discovery_capacity() -> bool:
+        return (
+            capacity_total < remote_fill_target
+            or any(
+                capacity_by_anchor[anchor_id] < remote_quotas[anchor_id]
+                for anchor_id in anchor_ids
+            )
+        )
+
+    def resolve_direct_until(deadline: float) -> None:
+        nonlocal direct_attempts, capacity_total, capacity_by_anchor
+        while (
+            remote_fill_target > 0
+            and needs_more_discovery_capacity()
+            and direct_attempts < max_direct_attempts
+            and time.monotonic() < deadline
+        ):
+            batch_keys: List[Tuple[str, str]] = []
+            batch_limit = min(6, max_direct_attempts - direct_attempts)
+            while len(batch_keys) < batch_limit:
+                progress = False
+                for related_anchor_id in stable_anchor_ids:
+                    queue = track_queues[related_anchor_id]
+                    position = track_positions[related_anchor_id]
+                    while (
+                        position < len(queue)
+                        and queue[position] in seen_resolve_keys
+                    ):
+                        position += 1
+                    track_positions[related_anchor_id] = position
+                    if position >= len(queue):
+                        continue
+                    key = queue[position]
+                    track_positions[related_anchor_id] += 1
+                    seen_resolve_keys.add(key)
+                    batch_keys.append(key)
+                    progress = True
+                    if len(batch_keys) >= batch_limit:
+                        break
+                if not progress:
+                    break
+            if not batch_keys:
+                break
+
+            direct_attempts += len(batch_keys)
+            exact_results: List[Tuple[Tuple[str, str], Optional[Dict]]] = []
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                future_map = {
+                    executor.submit(
+                        _resolve_spotify_track,
+                        track_metadata[key][0],
+                        track_metadata[key][1],
+                    ): key
+                    for key in batch_keys
+                    if key in track_metadata
+                }
+                for future in as_completed(future_map):
+                    key = future_map[future]
+                    try:
+                        exact_results.append((key, future.result()))
+                    except Exception:
+                        continue
+
+            for origin_track_key, track in sorted(
+                exact_results, key=lambda item: item[0]
+            ):
+                if not track or track.get("id") in known_track_ids:
+                    continue
+                artist_names = _artist_names(track)
+                semantic_key = _track_key(
+                    artist_names[0] if artist_names else "",
+                    track.get("name", ""),
+                )
+                if semantic_key in known_track_keys:
                     continue
                 add_candidate(
                     track,
-                    source="discovery",
-                    relation=evidence["score"],
-                    anchor_name=evidence["anchor"],
-                    via=f"similar artist · {evidence['anchor']}",
+                    "discovery",
+                    origin_track_key=origin_track_key,
                 )
-            discovery_pool_size = sum(
-                1 for candidate in candidates if candidate["source"] == "discovery"
-            )
-            if discovery_pool_size >= discovery_pool_target:
+            capacity_total, capacity_by_anchor = discovery_allocation_capacity()
+
+    resolve_direct_until(direct_acquisition_deadline)
+
+    while artist_fallback_possible and needs_more_discovery_capacity() and (
+        len(attempted_artists) < max_artist_attempts
+        and time.monotonic() < acquisition_deadline
+    ):
+        # Search several independent artist paths concurrently.  Sequential
+        # search+top-tracks calls let one slow anchor consume the shared 45s
+        # budget before the other anchors were even attempted.
+        artist_batch: List[str] = []
+        batch_limit = min(
+            6,
+            max_artist_attempts - len(attempted_artists),
+        )
+        while len(artist_batch) < batch_limit:
+            progress = False
+            for related_anchor_id in sorted(
+                stable_anchor_ids,
+                key=lambda anchor_id: (capacity_by_anchor[anchor_id], anchor_id),
+            ):
+                if (
+                    capacity_by_anchor[related_anchor_id]
+                    >= remote_quotas[related_anchor_id]
+                    and capacity_total >= remote_fill_target
+                ):
+                    continue
+                queue = artist_queues[related_anchor_id]
+                position = artist_positions[related_anchor_id]
+                while (
+                    position < len(queue)
+                    and queue[position] in attempted_artists
+                ):
+                    position += 1
+                artist_positions[related_anchor_id] = position
+                if position >= len(queue):
+                    continue
+                artist_key = queue[position]
+                artist_positions[related_anchor_id] += 1
+                attempted_artists.add(artist_key)
+                artist_batch.append(artist_key)
+                progress = True
+                if len(artist_batch) >= batch_limit:
+                    break
+            if not progress:
                 break
+        if not artist_batch:
+            break
 
-    candidates = [
+        def fetch_artist_tracks(artist_key: str) -> Tuple[str, List[Dict]]:
+            canonical_name = artist_display_names.get(artist_key, artist_key)
+            spotify_artist = search_artist(canonical_name)
+            if (
+                not spotify_artist
+                or _normalize_music_text(spotify_artist.get("name", ""))
+                != artist_key
+            ):
+                return artist_key, []
+            return (
+                artist_key,
+                get_artist_top_tracks(
+                    spotify_artist.get("id"), market="CH"
+                )[:3],
+            )
+
+        fetched_artist_tracks: List[Tuple[str, List[Dict]]] = []
+        # Spotify's development-mode rate limit is low; two concurrent lookup
+        # paths hide ordinary latency without creating a retry storm.
+        with ThreadPoolExecutor(max_workers=min(2, len(artist_batch))) as executor:
+            futures = [
+                executor.submit(fetch_artist_tracks, artist_key)
+                for artist_key in artist_batch
+            ]
+            for future in as_completed(futures):
+                try:
+                    fetched_artist_tracks.append(future.result())
+                except Exception:
+                    continue
+
+        for _, tracks in sorted(fetched_artist_tracks):
+            for track in tracks:
+                if not track or track.get("id") in known_track_ids:
+                    continue
+                names = _artist_names(track)
+                if _track_key(
+                    names[0] if names else "", track.get("name", "")
+                ) in known_track_keys:
+                    continue
+                add_candidate(track, "discovery")
+        capacity_total, capacity_by_anchor = discovery_allocation_capacity()
+
+    # If artist-supported paths are unavailable or still leave a genuine
+    # shortage, give the remaining shared budget back to viable direct leads.
+    # This preserves exact length for strong direct-only catalogs without
+    # allowing them to starve artist acquisition at the start.
+    if needs_more_discovery_capacity() and time.monotonic() < acquisition_deadline:
+        resolve_direct_until(acquisition_deadline)
+
+    untried_direct_leads = any(
+        any(key not in seen_resolve_keys for key in track_queues[anchor_id])
+        for anchor_id in anchor_ids
+    )
+    direct_resolution_truncated = untried_direct_leads and (
+        direct_attempts >= max_direct_attempts
+        or time.monotonic() >= acquisition_deadline
+    )
+
+    if needs_more_discovery_capacity() and (
+        direct_resolution_truncated
+        or len(attempted_artists) >= max_artist_attempts
+        or time.monotonic() >= acquisition_deadline
+    ):
+        warnings.append(
+            "Discovery acquisition reached its bounded request/time budget; "
+            "selection continued with every qualified candidate already found."
+        )
+
+    qualified_candidates = [
         candidate for candidate in candidates
-        if candidate["coherence_score"] >= coherence_threshold
+        if candidate["is_anchor"]
+        or candidate["coherence_score"] >= coherence_threshold
     ]
-    anchors = [candidate for candidate in candidates if candidate["is_anchor"]]
-    history_candidates = sorted(
-        [candidate for candidate in candidates if candidate["source"] == "history" and not candidate["is_anchor"]],
-        key=lambda candidate: (candidate["coherence_score"], candidate["play_count"]),
-        reverse=True,
-    )
-    discovery_candidates = sorted(
-        [candidate for candidate in candidates if candidate["source"] == "discovery"],
-        key=lambda candidate: candidate["coherence_score"],
-        reverse=True,
-    )
-
     selected: List[Dict] = []
     selected_ids: Set[str] = set()
     artist_counts: Dict[str, int] = {}
+    unsupported_direct_counts = {anchor_id: 0 for anchor_id in anchor_ids}
+    source_anchor_counts = {
+        "history": {anchor_id: 0 for anchor_id in anchor_ids},
+        "discovery": {anchor_id: 0 for anchor_id in anchor_ids},
+    }
 
-    def select(candidate: Dict) -> bool:
+    def select(
+        candidate: Dict,
+        related_anchor_id: str,
+        force: bool = False,
+        enforce_unsupported_limit: bool = False,
+    ) -> bool:
         track = candidate["track"]
         track_id = track.get("id")
-        artist_key = _candidate_artist_key(candidate)
-        if not track_id or track_id in selected_ids or not artist_key:
+        artist_keys = _candidate_artist_keys(candidate)
+        if not track_id or track_id in selected_ids or not artist_keys:
             return False
-        limit = max_per_anchor_artist if artist_key in anchor_artist_keys else max_per_similar_artist
-        if artist_counts.get(artist_key, 0) >= limit:
+        if not force:
+            if related_anchor_id not in candidate["anchor_affinities"]:
+                return False
+            if candidate["anchor_affinities"][related_anchor_id] < coherence_threshold:
+                return False
+        if not force and not fits_artist_caps(candidate, artist_counts):
             return False
+        if (
+            not force
+            and enforce_unsupported_limit
+            and is_unsupported_direct(candidate, related_anchor_id)
+            and unsupported_direct_counts[related_anchor_id]
+            >= unsupported_direct_limits[related_anchor_id]
+        ):
+            return False
+
+        candidate["primary_anchor_id"] = related_anchor_id
+        candidate["primary_anchor_name"] = anchor_by_id[related_anchor_id]["primary_artist"]
+        candidate["coherence_score"] = candidate["anchor_affinities"].get(
+            related_anchor_id,
+            candidate["coherence_score"],
+        )
+        evidence_type = candidate["evidence_types"].get(related_anchor_id, "artist")
+        anchor_name = candidate["primary_anchor_name"]
+        if candidate["is_anchor"]:
+            candidate["via"] = "anchor"
+        elif candidate["source"] == "history":
+            label = "track match" if evidence_type == "track" else "similar"
+            candidate["via"] = f"familiar · {label} to {anchor_name}"
+        else:
+            label = "track match" if evidence_type == "track" else "similar artist"
+            candidate["via"] = f"{label} · {anchor_name}"
+
         selected.append(candidate)
         selected_ids.add(track_id)
-        artist_counts[artist_key] = artist_counts.get(artist_key, 0) + 1
+        count_candidate_artists(candidate, artist_counts)
+        if is_unsupported_direct(candidate, related_anchor_id):
+            unsupported_direct_counts[related_anchor_id] += 1
+        source_anchor_counts[candidate["source"]][related_anchor_id] += 1
         return True
 
-    for candidate in anchors:
-        select(candidate)
+    for spec in anchor_specs:
+        candidate = candidate_by_id.get(spec["id"])
+        if candidate:
+            select(candidate, spec["id"], force=True)
 
-    for candidate in history_candidates:
-        if sum(item["source"] == "history" for item in selected) >= desired_history:
-            break
-        select(candidate)
-    for candidate in discovery_candidates:
-        if sum(item["source"] == "discovery" for item in selected) >= desired_discovery:
-            break
-        select(candidate)
+    history_target = max(requested_history, len(selected))
+    discovery_target = max(0, track_count - history_target)
+    if history_target != requested_history:
+        warnings.append(
+            "Anchor tracks require more familiar slots than requested; "
+            "the discovery target was reduced."
+        )
 
-    # If one side of the requested ratio has too few strong candidates, fill
-    # with the other side rather than silently returning a short playlist.
-    leftovers = sorted(
-        [*history_candidates, *discovery_candidates],
-        key=lambda candidate: candidate["coherence_score"],
-        reverse=True,
-    )
-    for candidate in leftovers:
-        if len(selected) >= track_count:
-            break
-        select(candidate)
+    source_targets = {
+        "history": history_target,
+        "discovery": discovery_target,
+    }
 
-    # Enrich candidate genres for transition ordering. Similarity-neighborhood
-    # tags remain as a dependable fallback when Spotify audio features are not
-    # available to the application.
-    selected_artist_ids = {
+    def selected_source_count(source: str) -> int:
+        return sum(source_anchor_counts[source].values())
+
+    def represented_anchor_artist_keys() -> Set[str]:
+        return {
+            artist_key
+            for candidate in selected
+            if not candidate["is_anchor"]
+            for artist_key in _candidate_artist_keys(candidate)
+            if artist_key in anchor_artist_keys
+        }
+
+    # Reserve one real, non-anchor catalog track for every credited artist
+    # when a qualified candidate, source slot, and artist cap make that
+    # possible.  The anchor itself deliberately does not satisfy this promise.
+    def catalog_options_for_artist(artist_key: str) -> List[Tuple]:
+        options: List[Tuple] = []
+        for track_id in anchor_catalog_candidate_ids.get(artist_key, set()):
+            candidate = candidate_by_id.get(track_id)
+            if (
+                not candidate
+                or candidate["is_anchor"]
+                or track_id in selected_ids
+                or artist_key not in _candidate_artist_keys(candidate)
+                or selected_source_count(candidate["source"])
+                >= source_targets[candidate["source"]]
+                or not fits_artist_caps(candidate, artist_counts)
+            ):
+                continue
+            eligible_anchors = [
+                anchor_id
+                for anchor_id in anchor_artist_anchors.get(artist_key, set())
+                if candidate["anchor_affinities"].get(anchor_id, -1)
+                >= coherence_threshold
+            ]
+            if not eligible_anchors:
+                continue
+            related_anchor_id = min(
+                eligible_anchors,
+                key=lambda anchor_id: (
+                    source_anchor_counts["history"][anchor_id]
+                    + source_anchor_counts["discovery"][anchor_id],
+                    -candidate["anchor_affinities"].get(anchor_id, 0),
+                    anchor_id,
+                ),
+            )
+            options.append((
+                allocation_key(candidate, related_anchor_id),
+                candidate,
+                related_anchor_id,
+            ))
+        return options
+
+    while True:
+        missing_artist_keys = sorted(
+            anchor_artist_keys - represented_anchor_artist_keys()
+        )
+        if not missing_artist_keys:
+            break
+        option_groups = [
+            (catalog_options_for_artist(artist_key), artist_key)
+            for artist_key in missing_artist_keys
+        ]
+        option_groups = [item for item in option_groups if item[0]]
+        if not option_groups:
+            break
+        options, chosen_artist_key = min(
+            option_groups,
+            key=lambda item: (len(item[0]), item[1]),
+        )
+        _, candidate, related_anchor_id = max(
+            options,
+            key=lambda item: (item[0], item[1]["track"].get("id", "")),
+        )
+        if not select(
+            candidate,
+            related_anchor_id,
+            enforce_unsupported_limit=True,
+        ):
+            # Reaching this branch means the option became stale during a
+            # prior multi-credit reservation.  Remove it from this requirement
+            # and let the next scarcity pass try another catalog track.
+            anchor_catalog_candidate_ids[chosen_artist_key].discard(
+                candidate["track"]["id"]
+            )
+
+    def balanced_source_quotas(total: int, source: str) -> Dict[str, int]:
+        """Water-fill this source against the mix already selected."""
+        quotas = dict(source_anchor_counts[source])
+        projected_totals = {
+            anchor_id: (
+                source_anchor_counts["history"][anchor_id]
+                + source_anchor_counts["discovery"][anchor_id]
+            )
+            for anchor_id in anchor_ids
+        }
+        slots = max(0, total - sum(quotas.values()))
+        for _ in range(slots):
+            anchor_id = min(
+                stable_anchor_ids,
+                key=lambda item: (projected_totals[item], item),
+            )
+            quotas[anchor_id] += 1
+            projected_totals[anchor_id] += 1
+        return quotas
+
+    def allocate_source(
+        source: str,
+        target: int,
+        *,
+        enforce_unsupported_limits: bool,
+        allow_redistribution: bool,
+        warn_on_anchor_shortage: bool,
+    ) -> None:
+        quotas = balanced_source_quotas(target, source)
+        pool = [
+            candidate for candidate in qualified_candidates
+            if candidate["source"] == source and not candidate["is_anchor"]
+        ]
+        # First satisfy each anchor's fair share with a true augmenting
+        # assignment. This can reroute a shared candidate to preserve the only
+        # remaining option for another anchor.
+        blocked_ids: Set[str] = set()
+        while sum(source_anchor_counts[source].values()) < target:
+            needs = {
+                anchor_id: max(
+                    0,
+                    quotas[anchor_id]
+                    - source_anchor_counts[source][anchor_id],
+                )
+                for anchor_id in anchor_ids
+            }
+            if not any(needs.values()):
+                break
+            plan = plan_assignments(
+                pool,
+                needs,
+                artist_counts,
+                selected_ids | blocked_ids,
+                unsupported_counts=unsupported_direct_counts,
+                enforce_unsupported_limits=enforce_unsupported_limits,
+            )
+            if not plan:
+                break
+            progress = False
+            for candidate, related_anchor_id in plan:
+                if select(
+                    candidate,
+                    related_anchor_id,
+                    enforce_unsupported_limit=enforce_unsupported_limits,
+                ):
+                    progress = True
+                else:
+                    blocked_ids.add(candidate["track"].get("id"))
+            if not progress:
+                break
+
+        if not allow_redistribution:
+            return
+
+        # Only after quotas cannot be met, redistribute genuine shortages.
+        quota_shortages = {
+            anchor_id: quotas[anchor_id] - source_anchor_counts[source][anchor_id]
+            for anchor_id in anchor_ids
+            if source_anchor_counts[source][anchor_id] < quotas[anchor_id]
+        }
+        if (
+            warn_on_anchor_shortage
+            and quota_shortages
+            and sum(source_anchor_counts[source].values()) < target
+        ):
+            shortage_labels = ", ".join(
+                f"{anchor_by_id[anchor_id]['primary_artist']} ({count})"
+                for anchor_id, count in sorted(quota_shortages.items())
+            )
+            warnings.append(
+                f"{source.capitalize()} anchor shortages were redistributed only "
+                f"after their qualified pools were exhausted: {shortage_labels}."
+            )
+        while sum(source_anchor_counts[source].values()) < target:
+            options = []
+            for candidate in pool:
+                if candidate["track"].get("id") in selected_ids:
+                    continue
+                eligible_anchors = [
+                    anchor_id for anchor_id in anchor_ids
+                    if anchor_id in candidate["anchor_affinities"]
+                    and candidate["anchor_affinities"][anchor_id] >= coherence_threshold
+                    and not (
+                        enforce_unsupported_limits
+                        and is_unsupported_direct(candidate, anchor_id)
+                        and unsupported_direct_counts[anchor_id]
+                        >= unsupported_direct_limits[anchor_id]
+                    )
+                ]
+                if not eligible_anchors:
+                    continue
+                related_anchor_id = min(
+                    eligible_anchors,
+                    key=lambda anchor_id: (
+                        source_anchor_counts[source][anchor_id],
+                        -candidate["anchor_affinities"].get(anchor_id, 0),
+                        anchor_id,
+                    ),
+                )
+                options.append((
+                    -source_anchor_counts[source][related_anchor_id],
+                    allocation_key(candidate, related_anchor_id),
+                    candidate,
+                    related_anchor_id,
+                ))
+            if not options:
+                break
+            _, _, candidate, related_anchor_id = max(
+                options, key=lambda item: item[:2]
+            )
+            if not select(
+                candidate,
+                related_anchor_id,
+                enforce_unsupported_limit=enforce_unsupported_limits,
+            ):
+                # It cannot become selectable after more artist caps accrue.
+                pool.remove(candidate)
+
+    unsupported_relaxed_for: Set[str] = set()
+    for source, target in (
+        ("history", history_target),
+        ("discovery", discovery_target),
+    ):
+        # Stage one preserves fair anchor quotas while honoring the supported
+        # evidence soft cap.  Do not redistribute yet: an underfilled anchor
+        # must get the first chance to use a relaxed direct path.
+        allocate_source(
+            source,
+            target,
+            enforce_unsupported_limits=True,
+            allow_redistribution=False,
+            warn_on_anchor_shortage=False,
+        )
+        before_relaxation = dict(unsupported_direct_counts)
+        if selected_source_count(source) < target:
+            allocate_source(
+                source,
+                target,
+                enforce_unsupported_limits=False,
+                allow_redistribution=True,
+                warn_on_anchor_shortage=True,
+            )
+            unsupported_relaxed_for.update(
+                anchor_id
+                for anchor_id in anchor_ids
+                if unsupported_direct_counts[anchor_id]
+                > max(
+                    unsupported_direct_limits[anchor_id],
+                    before_relaxation[anchor_id],
+                )
+            )
+
+    # If either requested source is genuinely exhausted, fill the remaining
+    # length from the other source and disclose that redistribution.
+    while len(selected) < track_count:
+        options = []
+        total_anchor_counts = {
+            anchor_id: (
+                source_anchor_counts["history"][anchor_id]
+                + source_anchor_counts["discovery"][anchor_id]
+            )
+            for anchor_id in anchor_ids
+        }
+        for candidate in qualified_candidates:
+            if candidate["track"].get("id") in selected_ids:
+                continue
+            eligible_anchors = [
+                anchor_id for anchor_id in anchor_ids
+                if anchor_id in candidate["anchor_affinities"]
+                and candidate["anchor_affinities"][anchor_id] >= coherence_threshold
+            ]
+            if not eligible_anchors:
+                continue
+            capped_anchors = [
+                anchor_id for anchor_id in eligible_anchors
+                if not is_unsupported_direct(candidate, anchor_id)
+                or unsupported_direct_counts[anchor_id]
+                < unsupported_direct_limits[anchor_id]
+            ]
+            within_soft_cap = bool(capped_anchors)
+            if capped_anchors:
+                eligible_anchors = capped_anchors
+            related_anchor_id = min(
+                eligible_anchors,
+                key=lambda anchor_id: (
+                    total_anchor_counts[anchor_id],
+                    -candidate["anchor_affinities"].get(anchor_id, 0),
+                    anchor_id,
+                ),
+            )
+            options.append((
+                -total_anchor_counts[related_anchor_id],
+                allocation_key(candidate, related_anchor_id),
+                candidate,
+                related_anchor_id,
+                within_soft_cap,
+            ))
+        if not options:
+            break
+        if any(item[4] for item in options):
+            options = [item for item in options if item[4]]
+        _, _, candidate, related_anchor_id, within_soft_cap = max(
+            options, key=lambda item: item[:2]
+        )
+        if (
+            not within_soft_cap
+            and is_unsupported_direct(candidate, related_anchor_id)
+        ):
+            unsupported_relaxed_for.add(related_anchor_id)
+        if not select(candidate, related_anchor_id):
+            qualified_candidates.remove(candidate)
+
+    if unsupported_relaxed_for:
+        labels = ", ".join(
+            anchor_by_id[anchor_id]["primary_artist"]
+            for anchor_id in sorted(unsupported_relaxed_for)
+        )
+        warnings.append(
+            "Direct-evidence soft cap relaxed only after supported candidate "
+            f"pools were exhausted: {labels}."
+        )
+
+    actual_history = sum(candidate["source"] == "history" for candidate in selected)
+    actual_discovery = sum(candidate["source"] == "discovery" for candidate in selected)
+    if actual_history < requested_history:
+        shortage = requested_history - actual_history
+        replacement = max(0, actual_discovery - requested_discovery)
+        if replacement >= shortage and len(selected) >= track_count:
+            fill_note = " discovery filled the shortage."
+        elif replacement:
+            fill_note = f" discovery partially filled {replacement} of {shortage} slots."
+        else:
+            fill_note = " those slots remain unfilled."
+        warnings.append(
+            f"Only {actual_history} of {requested_history} requested familiar tracks "
+            f"had strong enough evidence;{fill_note}"
+        )
+    if actual_discovery < requested_discovery:
+        shortage = requested_discovery - actual_discovery
+        replacement = max(0, actual_history - requested_history)
+        if replacement >= shortage and len(selected) >= track_count:
+            fill_note = " familiar tracks filled the shortage."
+        elif replacement:
+            fill_note = f" familiar tracks partially filled {replacement} of {shortage} slots."
+        else:
+            fill_note = " those slots remain unfilled."
+        warnings.append(
+            f"Only {actual_discovery} of {requested_discovery} requested discoveries "
+            f"had strong enough evidence;{fill_note}"
+        )
+    if len(selected) < track_count:
+        warnings.append(
+            f"Returned {len(selected)} of {track_count} tracks because the qualified "
+            "candidate pools were exhausted."
+        )
+
+    selected_artist_ids = list(dict.fromkeys(
         artist.get("id")
         for candidate in selected
         for artist in candidate["track"].get("artists", [])
         if artist.get("id")
+    ))
+    artist_rows = get_artists_bulk(selected_artist_ids)
+    selected_artist_by_id = {
+        artist.get("id"): artist for artist in artist_rows if artist
     }
     genre_by_artist = {
         artist.get("id"): set(artist.get("genres", []))
-        for artist in get_artists_bulk(list(selected_artist_ids))
-        if artist
+        for artist in artist_rows if artist
     }
     for candidate in selected:
         for artist in candidate["track"].get("artists", []):
             candidate["genres"].update(genre_by_artist.get(artist.get("id"), set()))
 
+    anchor_artist_ids = list(dict.fromkeys(
+        artist.get("id")
+        for spec in anchor_specs
+        for artist in spec["track"].get("artists", [])
+        if artist.get("id")
+    ))
+    anchor_artist_rows = [
+        selected_artist_by_id[artist_id]
+        for artist_id in anchor_artist_ids
+        if artist_id in selected_artist_by_id
+    ]
+    anchor_artist_by_id = {
+        artist.get("id"): artist for artist in anchor_artist_rows if artist
+    }
+    genre_queues: Dict[str, List[str]] = {}
+    for spec in anchor_specs:
+        genres: List[str] = []
+        for credited_artist in spec["track"].get("artists", []):
+            artist = anchor_artist_by_id.get(credited_artist.get("id"), {})
+            for genre in artist.get("genres", []):
+                if genre not in genres:
+                    genres.append(genre)
+        genre_queues[spec["id"]] = genres
+
+    anchor_genres: List[str] = []
+    genre_positions = {anchor_id: 0 for anchor_id in anchor_ids}
+    while True:
+        progress = False
+        for anchor_id in anchor_ids:
+            queue = genre_queues[anchor_id]
+            position = genre_positions[anchor_id]
+            while position < len(queue) and queue[position] in anchor_genres:
+                position += 1
+            genre_positions[anchor_id] = position
+            if position >= len(queue):
+                continue
+            anchor_genres.append(queue[position])
+            genre_positions[anchor_id] += 1
+            progress = True
+        if not progress:
+            break
+    artists_with_genres = {
+        artist.get("id") for artist in anchor_artist_rows if artist.get("genres")
+    }
+    genre_covered_anchors = sum(
+        any(
+            artist.get("id") in artists_with_genres
+            for artist in spec["track"].get("artists", [])
+        )
+        for spec in anchor_specs
+    )
+    if genre_covered_anchors < len(anchor_specs):
+        warnings.append(
+            "Spotify genre metadata was unavailable for "
+            f"{len(anchor_specs) - genre_covered_anchors} of {len(anchor_specs)} anchors; "
+            "the displayed genres are partial and were not used as similarity evidence."
+        )
+
     selected_tracks = [candidate["track"] for candidate in selected]
-    features_map = {candidate["track"]["id"]: candidate["features"] for candidate in selected}
-    genres_map = {candidate["track"]["id"]: candidate["genres"] for candidate in selected}
-    ordered_tracks = order_playlist(selected_tracks, features_map, genres_map, flow_mode)
+    features_map = {
+        candidate["track"]["id"]: candidate["features"] for candidate in selected
+    }
+    genres_map = {
+        candidate["track"]["id"]: candidate["genres"] for candidate in selected
+    }
+    group_map = {
+        candidate["track"]["id"]: candidate["primary_anchor_id"]
+        for candidate in selected
+    }
+    affinities_map = {
+        candidate["track"]["id"]: candidate["anchor_affinities"]
+        for candidate in selected
+    }
+    ordered_tracks = order_playlist(
+        selected_tracks,
+        features_map,
+        genres_map,
+        flow_mode,
+        group_map=group_map,
+        max_group_run=3,
+        affinities_map=affinities_map,
+    )
     candidate_map = {candidate["track"]["id"]: candidate for candidate in selected}
 
     result_tracks = []
@@ -1401,6 +2832,25 @@ def generate_vibe_playlist(
             "source": candidate["source"],
             "discovered_via": candidate.get("via"),
             "coherence_score": round(candidate["coherence_score"], 3),
+            "evidence_raw_match": (
+                round(
+                    candidate.get("raw_matches", {}).get(
+                        candidate["primary_anchor_id"]
+                    ),
+                    6,
+                )
+                if candidate.get("raw_matches", {}).get(
+                    candidate["primary_anchor_id"]
+                ) is not None
+                else None
+            ),
+            "primary_anchor_id": candidate["primary_anchor_id"],
+            "primary_anchor_name": candidate["primary_anchor_name"],
+            "anchor_affinities": {
+                anchor_id: round(candidate["anchor_affinities"][anchor_id], 3)
+                for anchor_id in anchor_ids
+                if anchor_id in candidate["anchor_affinities"]
+            },
             "energy": None,
             "valence": None,
             "tempo": None,
@@ -1409,10 +2859,30 @@ def generate_vibe_playlist(
 
     from .flow_ordering import compute_playlist_flow_stats
     flow_stats = compute_playlist_flow_stats(ordered_tracks, features_map, genres_map)
-    flow_stats["ordering_basis"] = "audio_features" if any(features_map.values()) else "artist_similarity"
+    if flow_mode == "shuffle":
+        flow_stats["ordering_basis"] = "shuffle"
+    elif any(features_map.values()):
+        flow_stats["ordering_basis"] = "audio_features"
+    elif len(anchor_ids) == 1:
+        flow_stats["ordering_basis"] = "artist_similarity"
+    else:
+        flow_stats["ordering_basis"] = "multi_anchor_similarity"
 
-    history_selected = sum(track["source"] == "history" for track in result_tracks)
-    discovery_selected = sum(track["source"] == "discovery" for track in result_tracks)
+    anchor_mix = []
+    for spec in anchor_specs:
+        related_tracks = [
+            track for track in result_tracks
+            if track["primary_anchor_id"] == spec["id"]
+        ]
+        anchor_mix.append({
+            "anchor_track_id": spec["id"],
+            "anchor_track": spec["title"],
+            "anchor_artist": ", ".join(spec["artists"]),
+            "count": len(related_tracks),
+            "history": sum(track["source"] == "history" for track in related_tracks),
+            "discovery": sum(track["source"] == "discovery" for track in related_tracks),
+        })
+
     return {
         "tracks": result_tracks,
         "vibe_profile": {
@@ -1425,8 +2895,12 @@ def generate_vibe_playlist(
         },
         "flow_stats": flow_stats,
         "counts": {
-            "history": history_selected,
-            "discovery": discovery_selected,
+            "history": actual_history,
+            "discovery": actual_discovery,
             "total": len(result_tracks),
+            "requested_history": requested_history,
+            "requested_discovery": requested_discovery,
         },
+        "anchor_mix": anchor_mix,
+        "warnings": warnings,
     }

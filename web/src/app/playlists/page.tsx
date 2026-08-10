@@ -6,6 +6,7 @@ import axios from 'axios';
 import {
   AnchorTrack,
   FlowMode,
+  VibePlaylistRequest,
   VibePlaylistResult,
   FrogAlternative,
   FrogExploration,
@@ -22,6 +23,46 @@ import FrogGraphExplorer from '@/components/FrogGraphExplorer';
 import { getFrogAlternativeScores } from '@/lib/frogAlternative';
 
 type PlaylistMode = 'vibe' | 'frog';
+
+interface VibeRecipe {
+  anchorTrackIds: string[];
+  trackCount: number;
+  discoveryRatio: number;
+  flowMode: FlowMode;
+  excludeArtists: string[];
+  coherenceThreshold: number;
+  maxPerAnchorArtist: number;
+  maxPerSimilarArtist: number;
+}
+
+interface VibeRunVariables {
+  token: number;
+  recipe: VibeRecipe;
+  request: VibePlaylistRequest;
+}
+
+interface CreatePlaylistVariables {
+  name: string;
+  trackIds: string[];
+  mode: PlaylistMode;
+}
+
+function vibeRecipeKey(recipe: VibeRecipe): string {
+  return JSON.stringify(recipe);
+}
+
+function vibeRequestFromRecipe(recipe: VibeRecipe): VibePlaylistRequest {
+  return {
+    anchor_track_ids: recipe.anchorTrackIds,
+    track_count: recipe.trackCount,
+    discovery_ratio: recipe.discoveryRatio,
+    flow_mode: recipe.flowMode,
+    exclude_artists: recipe.excludeArtists,
+    coherence_threshold: recipe.coherenceThreshold,
+    max_per_anchor_artist: recipe.maxPerAnchorArtist,
+    max_per_similar_artist: recipe.maxPerSimilarArtist,
+  };
+}
 
 const EXPLORATION_NODE_LIMIT = 600;
 const EXPLORATION_EDGE_LIMIT = 1200;
@@ -180,6 +221,10 @@ export default function PlaylistsPage() {
   const [frogPlaylistName, setFrogPlaylistName] = useState('Frog Transition');
 
   const [vibeResult, setVibeResult] = useState<VibePlaylistResult | null>(null);
+  const [vibeResultRecipe, setVibeResultRecipe] = useState<VibeRecipe | null>(null);
+  const [vibeResultValid, setVibeResultValid] = useState(false);
+  const [vibeLoading, setVibeLoading] = useState(false);
+  const [vibeError, setVibeError] = useState<unknown>(null);
   const [frogResult, setFrogResult] = useState<FrogPlaylistResult | null>(null);
 
   // Frog streaming state
@@ -194,6 +239,10 @@ export default function PlaylistsPage() {
   });
   const [frogOriginalResult, setFrogOriginalResult] = useState<FrogPlaylistResult | null>(null);
   const frogRunTokenRef = useRef(0);
+  const vibeRunTokenRef = useRef(0);
+  const activeVibeRunRef = useRef<{ token: number; recipeKey: string } | null>(null);
+  const createInFlightRef = useRef(false);
+  const vibePageMountedRef = useRef(true);
   const activeFrogRunRef = useRef<ActiveFrogRun | null>(null);
   const frogInputsRef = useRef<FrogRunInputs>({
     startTrackId: null,
@@ -238,27 +287,87 @@ export default function PlaylistsPage() {
   ]);
 
   useEffect(() => {
+    vibePageMountedRef.current = true;
     frogPageMountedRef.current = true;
     return () => {
+      vibePageMountedRef.current = false;
+      activeVibeRunRef.current = null;
       frogPageMountedRef.current = false;
       cancelActiveFrogRun();
     };
   }, [cancelActiveFrogRun]);
 
+  const currentVibeRecipe: VibeRecipe = {
+    anchorTrackIds: anchors.map((anchor) => anchor.track_id),
+    trackCount,
+    discoveryRatio,
+    flowMode,
+    excludeArtists: excludeArtists
+      .map((artist) => artist.trim())
+      .filter(Boolean)
+      .sort((left, right) => left.localeCompare(right)),
+    coherenceThreshold,
+    maxPerAnchorArtist,
+    maxPerSimilarArtist,
+  };
+  const currentVibeRecipeKey = vibeRecipeKey(currentVibeRecipe);
+  const vibeRecipeChanged = !!vibeResult
+    && (!vibeResultRecipe || vibeRecipeKey(vibeResultRecipe) !== currentVibeRecipeKey);
+  const vibeResultIsStale = !!vibeResult && (!vibeResultValid || vibeRecipeChanged);
+  const requestedDiscoveryCount = vibeResult
+    ? vibeResult.counts.requested_discovery
+      ?? (vibeResultRecipe
+        ? Math.floor(vibeResultRecipe.trackCount * vibeResultRecipe.discoveryRatio / 100)
+        : undefined)
+    : undefined;
+  const requestedHistoryCount = vibeResult
+    ? vibeResult.counts.requested_history
+      ?? (vibeResultRecipe && requestedDiscoveryCount !== undefined
+        ? vibeResultRecipe.trackCount - requestedDiscoveryCount
+        : undefined)
+    : undefined;
+  const discoveryShortfall = vibeResult && requestedDiscoveryCount !== undefined
+    ? requestedDiscoveryCount - vibeResult.counts.discovery
+    : 0;
+  const anchorMixMax = Math.max(
+    1,
+    ...(vibeResult?.anchor_mix ?? []).map((anchor) => anchor.count),
+  );
+  const measuredFlowTransitions = vibeResult?.flow_stats.measured_transitions ?? 0;
+  const totalFlowTransitions = vibeResult?.flow_stats.total_transitions ?? 0;
+  const hasMeasuredAudioFlow = !!vibeResult
+    && vibeResult.flow_stats.measurement_basis !== 'unavailable'
+    && measuredFlowTransitions > 0;
+
   const generateVibeMutation = useMutation({
-    mutationFn: () =>
-      generateVibePlaylist({
-        anchor_track_ids: anchors.map((a) => a.track_id),
-        track_count: trackCount,
-        discovery_ratio: discoveryRatio,
-        flow_mode: flowMode,
-        exclude_artists: excludeArtists,
-        coherence_threshold: coherenceThreshold,
-        max_per_anchor_artist: maxPerAnchorArtist,
-        max_per_similar_artist: maxPerSimilarArtist,
-      }),
-    onSuccess: (data) => {
+    mutationFn: ({ request }: VibeRunVariables) => generateVibePlaylist(request),
+    onSuccess: (data, variables) => {
+      const activeRun = activeVibeRunRef.current;
+      if (
+        !vibePageMountedRef.current
+        || !activeRun
+        || activeRun.token !== variables.token
+        || activeRun.recipeKey !== vibeRecipeKey(variables.recipe)
+      ) return;
       setVibeResult(data);
+      setVibeResultRecipe(variables.recipe);
+      setVibeResultValid(true);
+      setVibeError(null);
+    },
+    onError: (error, variables) => {
+      if (
+        !vibePageMountedRef.current
+        || activeVibeRunRef.current?.token !== variables.token
+      ) return;
+      setVibeError(error);
+    },
+    onSettled: (_data, _error, variables) => {
+      if (
+        !vibePageMountedRef.current
+        || activeVibeRunRef.current?.token !== variables.token
+      ) return;
+      activeVibeRunRef.current = null;
+      setVibeLoading(false);
     },
   });
 
@@ -427,10 +536,19 @@ export default function PlaylistsPage() {
   }, [frogOriginalResult]);
 
   const createMutation = useMutation({
-    mutationFn: ({ name, trackIds }: { name: string; trackIds: string[] }) =>
-      createPlaylist(name, trackIds, mode === 'vibe' ? 'Vibe playlist from Spotify History' : 'Frog transition playlist'),
+    mutationFn: ({ name, trackIds, mode: submittedMode }: CreatePlaylistVariables) =>
+      createPlaylist(
+        name,
+        trackIds,
+        submittedMode === 'vibe'
+          ? 'Vibe playlist from Spotify History'
+          : 'Frog transition playlist',
+      ),
     onSuccess: (data) => {
       if (data.url) window.open(data.url, '_blank');
+    },
+    onSettled: () => {
+      createInFlightRef.current = false;
     },
   });
 
@@ -457,23 +575,50 @@ export default function PlaylistsPage() {
   };
 
   const handleGenerate = () => {
+    if (createInFlightRef.current || createMutation.isPending) return;
     if (mode === 'vibe') {
       if (anchors.length === 0) return;
-      generateVibeMutation.mutate();
+      createMutation.reset();
+      const recipe: VibeRecipe = {
+        ...currentVibeRecipe,
+        anchorTrackIds: [...currentVibeRecipe.anchorTrackIds],
+        excludeArtists: [...currentVibeRecipe.excludeArtists],
+      };
+      const token = ++vibeRunTokenRef.current;
+      activeVibeRunRef.current = {
+        token,
+        recipeKey: vibeRecipeKey(recipe),
+      };
+      setVibeLoading(true);
+      setVibeError(null);
+      setVibeResultValid(false);
+      generateVibeMutation.mutate({
+        token,
+        recipe,
+        request: vibeRequestFromRecipe(recipe),
+      });
     } else {
       handleGenerateFrog();
     }
   };
 
   const handleCreate = () => {
+    if (createInFlightRef.current || createMutation.isPending) return;
     if (mode === 'vibe') {
-      if (!vibeResult?.tracks.length) return;
+      if (
+        !vibeResult?.tracks.length
+        || vibeResultIsStale
+        || vibeLoading
+        || activeVibeRunRef.current
+      ) return;
       const trackIds = vibeResult.tracks.map((t) => t.track_id).filter(Boolean);
-      createMutation.mutate({ name: playlistName, trackIds });
+      createInFlightRef.current = true;
+      createMutation.mutate({ name: playlistName, trackIds, mode: 'vibe' });
     } else {
       if (!frogResult?.tracks.length) return;
       const trackIds = frogResult.tracks.map((t) => t.track_id).filter(Boolean);
-      createMutation.mutate({ name: frogPlaylistName, trackIds });
+      createInFlightRef.current = true;
+      createMutation.mutate({ name: frogPlaylistName, trackIds, mode: 'frog' });
     }
   };
 
@@ -486,20 +631,25 @@ export default function PlaylistsPage() {
   };
 
   const flowModes: { value: FlowMode; label: string; desc: string }[] = [
-    { value: 'smooth', label: 'Smooth Flow', desc: 'Anchor first, then closest neighbors' },
+    { value: 'smooth', label: 'Smooth Flow', desc: 'Woven mini-runs across your anchors' },
     { value: 'energy_arc', label: 'Energy Arc', desc: 'Uses energy data when Spotify provides it' },
     { value: 'shuffle', label: 'Shuffle', desc: 'Random order' },
   ];
 
-  const isGenerating = mode === 'vibe' ? generateVibeMutation.isPending : frogLoading;
-  const hasError = mode === 'vibe' ? generateVibeMutation.isError : !!frogError;
+  const isGenerating = mode === 'vibe' ? vibeLoading : frogLoading;
+  const hasError = mode === 'vibe' ? vibeError !== null : !!frogError;
   const canGenerate = mode === 'vibe' ? anchors.length > 0 : (startTrack && endTrack);
-  const vibeError = generateVibeMutation.error;
   const vibeErrorMessage = axios.isAxiosError<{ detail?: string }>(vibeError)
     ? vibeError.response?.data?.detail || vibeError.message
     : vibeError instanceof Error
       ? vibeError.message
       : 'Failed to generate playlist.';
+  const createErrorMessage = axios.isAxiosError<{ detail?: string }>(createMutation.error)
+    ? createMutation.error.response?.data?.detail || createMutation.error.message
+    : createMutation.error instanceof Error
+      ? createMutation.error.message
+      : 'Failed to create the playlist on Spotify.';
+  const createFeedbackForCurrentMode = createMutation.variables?.mode === mode;
   const frogRouteEdited = !!frogResult
     && !!frogOriginalResult
     && frogResult.tracks.some(
@@ -1035,7 +1185,7 @@ export default function PlaylistsPage() {
           ) : (
             <button
               onClick={handleGenerate}
-              disabled={!canGenerate || isGenerating}
+              disabled={!canGenerate || isGenerating || createMutation.isPending}
               className="w-full btn-primary py-3 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
             >
               {isGenerating ? (
@@ -1071,7 +1221,10 @@ export default function PlaylistsPage() {
                   </div>
                   <button
                     onClick={handleCreate}
-                    disabled={createMutation.isPending}
+                    disabled={createMutation.isPending || vibeResultIsStale || vibeLoading}
+                    title={vibeResultIsStale
+                      ? 'Regenerate this playlist after changing its recipe.'
+                      : undefined}
                     className="btn-primary disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
                   >
                     {createMutation.isPending ? (
@@ -1079,22 +1232,73 @@ export default function PlaylistsPage() {
                         <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                         Creating...
                       </>
+                    ) : vibeResultIsStale ? (
+                      'Regenerate first'
+                    ) : vibeLoading ? (
+                      'Refreshing...'
                     ) : (
                       'Create on Spotify'
                     )}
                   </button>
                 </div>
 
-                {createMutation.isSuccess && (
+                {vibeResultIsStale && (
+                  <div className="mb-4 p-3 rounded-lg bg-amber-500/10 border border-amber-400/30 text-amber-200 text-sm">
+                    <span className="font-medium">
+                      {vibeRecipeChanged
+                        ? 'Recipe changed.'
+                        : vibeLoading
+                          ? 'Regenerating playlist.'
+                          : vibeError
+                            ? 'Latest generation failed.'
+                            : 'Regeneration required.'}
+                    </span>{' '}
+                    {vibeRecipeChanged
+                      ? 'This preview uses your previous anchors or settings.'
+                      : 'This is the previous preview.'}{' '}
+                    Generate it successfully before creating it on Spotify.
+                  </div>
+                )}
+
+                {!vibeResultIsStale && createFeedbackForCurrentMode && createMutation.isSuccess && (
                   <div className="mb-4 p-3 rounded-lg bg-green-500/10 border border-green-500/20 text-green-400 text-sm">
-                    Playlist created successfully!
+                    Playlist created successfully.{' '}
+                    {createMutation.data?.url && (
+                      <a
+                        href={createMutation.data.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="font-medium underline underline-offset-2"
+                      >
+                        Open playlist
+                      </a>
+                    )}
+                  </div>
+                )}
+
+                {createFeedbackForCurrentMode && createMutation.isError && (
+                  <div className="mb-4 p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
+                    {createErrorMessage}
+                  </div>
+                )}
+
+                {vibeResult.warnings && vibeResult.warnings.length > 0 && (
+                  <div className="mb-4 space-y-2">
+                    {vibeResult.warnings.map((warning, index) => (
+                      <div
+                        key={`${warning}-${index}`}
+                        className="p-2.5 rounded-lg bg-amber-500/10 border border-amber-400/20 text-amber-100/90 text-xs"
+                      >
+                        {warning}
+                      </div>
+                    ))}
                   </div>
                 )}
 
                 {/* Vibe Profile */}
                 {vibeResult.vibe_profile.top_genres.length > 0 && (
                   <div className="mb-3">
-                    <p className="text-xs text-[var(--text-muted)] mb-1">Vibe genres:</p>
+                    <p className="text-xs text-[var(--text-muted)] mb-1">Available anchor genres:</p>
                     <div className="flex flex-wrap gap-1">
                       {vibeResult.vibe_profile.top_genres.map((g) => (
                         <span
@@ -1108,14 +1312,79 @@ export default function PlaylistsPage() {
                   </div>
                 )}
 
+                {vibeResult.anchor_mix && vibeResult.anchor_mix.length > 0 && (
+                  <div className="mb-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <p className="text-xs text-[var(--text-muted)]">Anchor blend</p>
+                      <p className="text-[10px] text-[var(--text-muted)]">familiar + new</p>
+                    </div>
+                    <div className="space-y-2">
+                      {vibeResult.anchor_mix.map((anchor) => {
+                        const historyWidth = anchor.count > 0
+                          ? (anchor.history / anchor.count) * 100
+                          : 0;
+                        const discoveryWidth = anchor.count > 0
+                          ? (anchor.discovery / anchor.count) * 100
+                          : 0;
+                        return (
+                          <div key={anchor.anchor_track_id}>
+                            <div className="flex items-baseline justify-between gap-3 text-xs mb-1">
+                              <p className="truncate text-[var(--text-secondary)]">
+                                <span className="text-[var(--text-primary)]">{anchor.anchor_track}</span>
+                                {' · '}{anchor.anchor_artist}
+                              </p>
+                              <span className="shrink-0 tabular-nums text-[var(--text-muted)]">
+                                {anchor.count} ({anchor.history}+{anchor.discovery})
+                              </span>
+                            </div>
+                            <div className="h-1.5 rounded-full overflow-hidden bg-[var(--bg-secondary)]">
+                              <div
+                                className="h-full flex rounded-full overflow-hidden"
+                                style={{ width: `${(anchor.count / anchorMixMax) * 100}%` }}
+                              >
+                                <div
+                                  className="h-full bg-[var(--accent-primary)]"
+                                  style={{ width: `${historyWidth}%` }}
+                                />
+                                <div
+                                  className="h-full bg-[var(--accent-secondary)]"
+                                  style={{ width: `${discoveryWidth}%` }}
+                                />
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
                 {/* Stats */}
-                <div className="flex gap-4 text-xs text-[var(--text-muted)]">
-                  <span>History: {vibeResult.counts.history}</span>
-                  <span>Discovery: {vibeResult.counts.discovery}</span>
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-[var(--text-muted)]">
                   <span>
-                    {vibeResult.flow_stats.ordering_basis === 'artist_similarity'
-                      ? 'Flow: artist similarity'
-                      : `Smooth transitions: ${vibeResult.flow_stats.smooth_transitions}`}
+                    Familiar: {vibeResult.counts.history}
+                    {requestedHistoryCount !== undefined && ` / ${requestedHistoryCount} target`}
+                  </span>
+                  <span>
+                    New: {vibeResult.counts.discovery}
+                    {requestedDiscoveryCount !== undefined && ` / ${requestedDiscoveryCount} target`}
+                  </span>
+                  {discoveryShortfall > 0 && (
+                    <span className="text-amber-300">{discoveryShortfall} new tracks short</span>
+                  )}
+                  {discoveryShortfall < 0 && (
+                    <span className="text-[var(--text-secondary)]">{Math.abs(discoveryShortfall)} extra new</span>
+                  )}
+                  <span>
+                    {vibeResultRecipe?.flowMode === 'shuffle'
+                      ? 'Flow: shuffled'
+                      : vibeResultRecipe?.flowMode === 'energy_arc'
+                      ? hasMeasuredAudioFlow
+                        ? `Energy arc · audio measured ${measuredFlowTransitions}/${totalFlowTransitions} hops`
+                        : 'Energy data unavailable · used balanced anchor weave'
+                      : hasMeasuredAudioFlow
+                      ? `Flow: audio-smoothed · measured ${measuredFlowTransitions}/${totalFlowTransitions} hops`
+                      : 'Flow: balanced anchor weave · audio smoothness not measured'}
                   </span>
                 </div>
               </div>
@@ -1136,7 +1405,7 @@ export default function PlaylistsPage() {
                           ? `New · ${track.discovered_via || 'discovery'}`
                           : track.discovered_via === 'anchor'
                             ? `Anchor · ${track.play_count} plays`
-                            : `${track.play_count} plays`
+                            : `${track.play_count} plays${track.discovered_via ? ` · ${track.discovered_via}` : ''}`
                       }
                       index={i}
                       energy={track.energy}
@@ -1181,9 +1450,25 @@ export default function PlaylistsPage() {
                   </button>
                 </div>
 
-                {createMutation.isSuccess && (
+                {createFeedbackForCurrentMode && createMutation.isSuccess && (
                   <div className="mb-4 p-3 rounded-lg bg-green-500/10 border border-green-500/20 text-green-400 text-sm">
-                    Playlist created successfully!
+                    Playlist created successfully.{' '}
+                    {createMutation.data?.url && (
+                      <a
+                        href={createMutation.data.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="font-medium underline underline-offset-2"
+                      >
+                        Open playlist
+                      </a>
+                    )}
+                  </div>
+                )}
+
+                {createFeedbackForCurrentMode && createMutation.isError && (
+                  <div className="mb-4 p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
+                    {createErrorMessage}
                   </div>
                 )}
 

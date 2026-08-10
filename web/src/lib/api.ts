@@ -240,6 +240,9 @@ export interface VibeTrack {
   valence?: number | null;
   tempo?: number | null;
   play_count: number;
+  primary_anchor_id?: string | null;
+  primary_anchor_name?: string | null;
+  anchor_affinities?: Record<string, number>;
 }
 
 export interface VibeProfile {
@@ -252,22 +255,37 @@ export interface VibeProfile {
 }
 
 export interface FlowStats {
-  avg_transition_cost: number;
-  max_transition_cost: number;
-  smooth_transitions: number;
-  jarring_transitions: number;
+  avg_transition_cost: number | null;
+  max_transition_cost: number | null;
+  smooth_transitions: number | null;
+  jarring_transitions: number | null;
   total_transitions: number;
-  ordering_basis?: 'audio_features' | 'artist_similarity';
+  measured_transitions: number;
+  measurement_basis: 'audio_features' | 'partial_audio_features' | 'unavailable';
+  ordering_basis?: 'audio_features' | 'artist_similarity' | 'multi_anchor_similarity' | 'shuffle';
+}
+
+export interface VibeAnchorMix {
+  anchor_track_id: string;
+  anchor_track: string;
+  anchor_artist: string;
+  count: number;
+  history: number;
+  discovery: number;
 }
 
 export interface VibePlaylistResult {
   tracks: VibeTrack[];
   vibe_profile: VibeProfile;
   flow_stats: FlowStats;
+  anchor_mix?: VibeAnchorMix[];
+  warnings?: string[];
   counts: {
     history: number;
     discovery: number;
     total: number;
+    requested_history?: number;
+    requested_discovery?: number;
   };
 }
 
@@ -292,12 +310,16 @@ export interface VibePlaylistRequest {
   exclude_artists?: string[];
   // Advanced tuning
   coherence_threshold?: number;  // 0-100
-  max_per_anchor_artist?: number;  // 1-10
+  max_per_anchor_artist?: number;  // 0-10
   max_per_similar_artist?: number;  // 1-10
 }
 
 export const generateVibePlaylist = (request: VibePlaylistRequest) =>
-  api.post<VibePlaylistResult>('/recommendations/vibe', request).then(r => r.data);
+  api.post<VibePlaylistResult>('/recommendations/vibe', request, {
+    // A large multi-anchor mix performs bounded Spotify and Last.fm searches.
+    // Keep this scoped here so ordinary page requests retain the 20s timeout.
+    timeout: 120_000,
+  }).then(r => r.data);
 
 export const searchSpotifyTracks = (query: string, limit = 20) =>
   api.get<AnchorTrack[]>('/tracks/search', { params: { q: query, limit } }).then(r => r.data);
